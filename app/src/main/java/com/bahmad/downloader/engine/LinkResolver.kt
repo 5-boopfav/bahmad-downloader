@@ -2,6 +2,7 @@ package com.bahmad.downloader.engine
 
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 data class ResolvedLinkInfo(
@@ -11,7 +12,8 @@ data class ResolvedLinkInfo(
     val sourceLabel: String,
     val fileSizeBytes: Long,
     val supportsRange: Boolean,
-    val suggestedFormats: List<String>
+    val suggestedFormats: List<String>,
+    val note: String? = null
 )
 
 class LinkResolver(
@@ -25,6 +27,10 @@ class LinkResolver(
     fun resolve(rawInput: String): ResolvedLinkInfo {
         val cleanUrl = rawInput.trim()
         val lower = cleanUrl.lowercase()
+
+        if (lower.contains("dailymotion.com") || lower.contains("dai.ly")) {
+            return resolveDailymotion(cleanUrl)
+        }
 
         if (lower.contains("drive.google.com")) {
             val fileId = extractGoogleDriveId(cleanUrl)
@@ -69,6 +75,72 @@ class LinkResolver(
         )
     }
 
+    private fun resolveDailymotion(url: String): ResolvedLinkInfo {
+        val videoId = Regex("(?:video/|dai\\.ly/)([a-zA-Z0-9]+)")
+            .find(url)?.groupValues?.get(1)
+
+        if (videoId != null) {
+            try {
+                val metaUrl = "https://www.dailymotion.com/player/metadata/video/$videoId"
+                val req = Request.Builder()
+                    .url(metaUrl)
+                    .header("User-Agent", "Mozilla/5.0 (Linux; Android 14)")
+                    .build()
+                client.newCall(req).execute().use { resp ->
+                    if (resp.isSuccessful) {
+                        val bodyStr = resp.body?.string().orEmpty()
+                        val json = JSONObject(bodyStr)
+                        val title = json.optString("title").ifBlank { "dailymotion_$videoId" }
+                            .replace(Regex("[^a-zA-Z0-9._\\-\\u0600-\\u06FF ]"), "_")
+                        val qualities = json.optJSONObject("qualities")
+                        val streamUrl = extractBestStreamUrl(qualities)
+
+                        if (streamUrl != null) {
+                            val probe = probeUrl(streamUrl)
+                            val ext = if (streamUrl.contains(".m3u8")) ".m3u8" else ".mp4"
+                            return ResolvedLinkInfo(
+                                originalUrl = url,
+                                directDownloadUrl = streamUrl,
+                                fileName = "$title$ext",
+                                sourceLabel = "Dailymotion",
+                                fileSizeBytes = probe.contentLength,
+                                supportsRange = probe.acceptRanges,
+                                suggestedFormats = listOf("MP4 / بث مباشر", "جودة عالية"),
+                                note = if (ext == ".m3u8") "ملف قائمة بث HLS — قد يتطلب أداة دمج لملف MP4 كامل" else null
+                            )
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+
+        return ResolvedLinkInfo(
+            originalUrl = url,
+            directDownloadUrl = url,
+            fileName = "dailymotion_${videoId ?: System.currentTimeMillis()}.mp4",
+            sourceLabel = "Dailymotion",
+            fileSizeBytes = -1L,
+            supportsRange = false,
+            suggestedFormats = listOf("MP4"),
+            note = "Dailymotion يحمي روابط الفيديو المباشرة؛ التحميل المباشر لصفحة الفيديو قد لا ينتج ملف فيديو صالح."
+        )
+    }
+
+    private fun extractBestStreamUrl(qualities: JSONObject?): String? {
+        if (qualities == null) return null
+        val order = listOf("1080", "720", "480", "380", "240", "auto")
+        for (q in order) {
+            val arr = qualities.optJSONArray(q) ?: continue
+            for (i in 0 until arr.length()) {
+                val item = arr.optJSONObject(i) ?: continue
+                val url = item.optString("url")
+                if (url.startsWith("http")) return url
+            }
+        }
+        return null
+    }
+
     private fun extractGoogleDriveId(url: String): String? {
         val dMatch = Regex("/d/([a-zA-Z0-9_-]+)").find(url)
         if (dMatch != null) return dMatch.groupValues[1]
@@ -77,6 +149,7 @@ class LinkResolver(
     }
 
     private fun detectSourceLabel(lowerUrl: String): String = when {
+        lowerUrl.contains("dailymotion.com") || lowerUrl.contains("dai.ly") -> "Dailymotion"
         lowerUrl.contains("drive.google.com") -> "Google Drive"
         lowerUrl.contains("docs.google.com") -> "Google Docs"
         lowerUrl.contains("youtube.com") || lowerUrl.contains("youtu.be") -> "YouTube"
