@@ -1,10 +1,11 @@
 package com.bahmad.downloader
 
 import android.annotation.SuppressLint
+import android.app.DownloadManager
 import android.content.Context
-import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.os.Environment
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -174,7 +175,7 @@ private fun BahmadMainScreen() {
                                 val target = urlInput.trim()
                                 if (target.isNotEmpty() && !isChecking) {
                                     isChecking = true
-                                    statusMessage = "جاري فحص الرابط..."
+                                    statusMessage = "جاري فحص الرابط واستخراج الوسائط..."
                                     scope.launch {
                                         val result = withContext(Dispatchers.IO) {
                                             resolver.resolve(target)
@@ -224,7 +225,7 @@ private fun BahmadMainScreen() {
                         color = BahmadGold
                     )
                     Text(
-                        text = "ستظهر المهام الجديدة هنا عند بدء تحميل ملف مباشر.",
+                        text = "يتم حفظ الملفات المباشرة في مجلد التنزيلات (Downloads) بالامتداد المناسب.",
                         color = Color(0xFFB0B7C3)
                     )
                 }
@@ -424,13 +425,48 @@ private fun enqueueDirectDownload(
     fileName: String,
     format: String
 ) {
-    // إذا كان لديك BahmadDownloadManager أو DownloadForegroundService في مشروعك،
-    // اربطهما هنا حسب أسماء الدوال الموجودة في ملفاتهما.
+    val cleanUrl = url.trim()
+    if (!cleanUrl.startsWith("http://") && !cleanUrl.startsWith("https://")) return
+
+    val safeName = ensureMediaFileName(fileName, cleanUrl, format)
+
     try {
-        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        context.startActivity(intent)
+        val downloadManager = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+        val request = DownloadManager.Request(Uri.parse(cleanUrl))
+            .setTitle(safeName)
+            .setDescription("بحمد للتحميل — $format")
+            .addRequestHeader(
+                "User-Agent",
+                "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+            )
+            .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+            .setAllowedOverMetered(true)
+            .setAllowedOverRoaming(true)
+            .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, safeName)
+
+        downloadManager.enqueue(request)
     } catch (_: Exception) {
     }
+}
+
+private fun ensureMediaFileName(rawName: String, url: String, format: String): String {
+    val stripped = rawName
+        .replace(Regex("[\\\\/:*?\"<>|]"), "_")
+        .trim()
+        .ifBlank { "bahmad_media_${System.currentTimeMillis()}" }
+
+    val lowerUrl = url.lowercase()
+    val hasKnownExt = Regex("\\.(mp4|mp3|m4a|webm|mkv|m3u8|pdf|zip|apk|jpg|jpeg|png)$", RegexOption.IGNORE_CASE)
+        .containsMatchIn(stripped)
+
+    if (hasKnownExt) return stripped
+
+    val ext = when {
+        format.contains("MP3", ignoreCase = true) || lowerUrl.contains(".mp3") -> ".mp3"
+        lowerUrl.contains(".m3u8") -> ".m3u8"
+        lowerUrl.contains(".webm") -> ".webm"
+        lowerUrl.contains(".mkv") -> ".mkv"
+        else -> ".mp4"
+    }
+    return "$stripped$ext"
 }
