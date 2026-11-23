@@ -13,7 +13,8 @@ data class ResolvedLinkInfo(
     val fileSizeBytes: Long,
     val supportsRange: Boolean,
     val suggestedFormats: List<String>,
-    val note: String? = null
+    val note: String? = null,
+    val isHtmlPage: Boolean = false
 )
 
 class LinkResolver(
@@ -47,21 +48,31 @@ class LinkResolver(
                 sourceLabel = "Google Drive",
                 fileSizeBytes = head.contentLength,
                 supportsRange = head.acceptRanges,
-                suggestedFormats = listOf("الملف الأصلي", "ZIP / أرشيف", "MP4", "MP3")
+                suggestedFormats = listOf("الملف الأصلي", "ZIP / أرشيف", "MP4", "MP3"),
+                note = if (head.isHtml) "قد يتطلب الرابط مشاركة عامة (Anyone with the link) لتنزيل الملف مباشرة." else null,
+                isHtmlPage = head.isHtml
             )
         }
 
         val probe = probeUrl(cleanUrl)
         val sourceName = detectSourceLabel(lower)
-        val generatedName = probe.fileName ?: buildFallbackName(lower, sourceName)
+        val generatedName = probe.fileName ?: buildFallbackName(lower, sourceName, probe.isHtml)
 
         val formats = when {
             generatedName.endsWith(".mp3") || generatedName.endsWith(".m4a") || generatedName.endsWith(".wav") ->
                 listOf("MP3 (جودة عالية)", "الملف الأصلي")
             generatedName.endsWith(".mp4") || generatedName.endsWith(".mkv") || generatedName.endsWith(".webm") ->
                 listOf("1080p HD", "720p", "480p", "MP3 (صوت فقط)")
+            generatedName.endsWith(".m3u8") ->
+                listOf("قائمة بث HLS (.m3u8)")
             else ->
                 listOf("أعلى سرعة (مباشر)", "1080p", "720p", "MP3")
+        }
+
+        val htmlNote = if (probe.isHtml) {
+            "هذا الرابط صفحة ويب (HTML) وليس ملفاً مباشراً؛ يُفضّل فتحه في المتصفح الداخلي وتشغيل الفيديو لالتقاط رابط الوسائط."
+        } else {
+            null
         }
 
         return ResolvedLinkInfo(
@@ -71,7 +82,9 @@ class LinkResolver(
             sourceLabel = sourceName,
             fileSizeBytes = probe.contentLength,
             supportsRange = probe.acceptRanges,
-            suggestedFormats = formats
+            suggestedFormats = formats,
+            note = htmlNote,
+            isHtmlPage = probe.isHtml
         )
     }
 
@@ -106,7 +119,12 @@ class LinkResolver(
                                 fileSizeBytes = probe.contentLength,
                                 supportsRange = probe.acceptRanges,
                                 suggestedFormats = listOf("MP4 / بث مباشر", "جودة عالية"),
-                                note = if (ext == ".m3u8") "ملف قائمة بث HLS — قد يتطلب أداة دمج لملف MP4 كامل" else null
+                                note = if (ext == ".m3u8") {
+                                    "تم العثور على قائمة بث HLS (.m3u8)؛ تحميل ملف .m3u8 وحده يحفظ قائمة المقاطع وليس فيديو مدمجاً."
+                                } else {
+                                    null
+                                },
+                                isHtmlPage = false
                             )
                         }
                     }
@@ -123,7 +141,8 @@ class LinkResolver(
             fileSizeBytes = -1L,
             supportsRange = false,
             suggestedFormats = listOf("MP4"),
-            note = "Dailymotion يحمي روابط الفيديو المباشرة؛ التحميل المباشر لصفحة الفيديو قد لا ينتج ملف فيديو صالح."
+            note = "رابط صفحة Dailymotion وليس رابط ملف مباشر؛ افتحه في المتصفح الداخلي وشغّل الفيديو لالتقاط الروابط.",
+            isHtmlPage = true
         )
     }
 
@@ -163,12 +182,13 @@ class LinkResolver(
         else -> "رابط / ملف مباشر"
     }
 
-    private fun buildFallbackName(lowerUrl: String, source: String): String {
+    private fun buildFallbackName(lowerUrl: String, source: String, isHtml: Boolean): String {
         val lastSegment = lowerUrl.substringAfterLast("/").substringBefore("?")
-        if (lastSegment.contains(".") && lastSegment.length in 3..60) {
+        if (!isHtml && lastSegment.contains(".") && lastSegment.length in 3..60) {
             return lastSegment
         }
         val ext = when {
+            lowerUrl.contains(".m3u8") -> ".m3u8"
             lowerUrl.contains(".mp4") -> ".mp4"
             lowerUrl.contains(".mp3") -> ".mp3"
             lowerUrl.contains(".pdf") -> ".pdf"
@@ -176,6 +196,7 @@ class LinkResolver(
             lowerUrl.contains(".apk") -> ".apk"
             lowerUrl.contains(".jpg") || lowerUrl.contains(".jpeg") -> ".jpg"
             lowerUrl.contains(".png") -> ".png"
+            isHtml -> ".html"
             else -> ".bin"
         }
         return "bahmad_${source.replace(" ", "_").lowercase()}_${System.currentTimeMillis()}$ext"
@@ -185,17 +206,50 @@ class LinkResolver(
         val finalUrl: String?,
         val fileName: String?,
         val contentLength: Long,
-        val acceptRanges: Boolean
+        val acceptRanges: Boolean,
+        val isHtml: Boolean
     )
 
     private fun probeUrl(url: String): ProbeResult {
+        val ua = "Mozilla/5.0 (Linux; Android 14) BahmadDownloader/1.0"
+
+        try {
+            val headReq = Request.Builder()
+                .url(url)
+                .head()
+                .header("User-Agent", ua)
+                .build()
+            client.newCall(headReq).execute().use { resp ->
+                val contentType = resp.header("Content-Type")?.lowercase().orEmpty()
+                val isHtml = contentType.contains("text/html") || contentType.contains("application/xhtml")
+                val disposition = resp.header("Content-Disposition")
+                val headerName = disposition?.let {
+                    Regex("filename=\"?([^\";]+)\"?").find(it)?.groupValues?.get(1)
+                }
+                val headLen = resp.header("Content-Length")?.toLongOrNull() ?: -1L
+                val ranges = resp.header("Accept-Ranges")?.equals("bytes", ignoreCase = true) == true || headLen > 1_000_000L
+                if (headLen > 0L || isHtml) {
+                    return ProbeResult(
+                        finalUrl = resp.request.url.toString(),
+                        fileName = headerName,
+                        contentLength = headLen,
+                        acceptRanges = ranges,
+                        isHtml = isHtml
+                    )
+                }
+            }
+        } catch (_: Exception) {
+        }
+
         return try {
             val request = Request.Builder()
                 .url(url)
-                .header("User-Agent", "Mozilla/5.0 (Linux; Android 14) BahmadDownloader/1.0")
+                .header("User-Agent", ua)
                 .build()
 
             client.newCall(request).execute().use { response ->
+                val contentType = response.header("Content-Type")?.lowercase().orEmpty()
+                val isHtml = contentType.contains("text/html") || contentType.contains("application/xhtml")
                 val disposition = response.header("Content-Disposition")
                 val headerName = disposition?.let {
                     Regex("filename=\"?([^\";]+)\"?").find(it)?.groupValues?.get(1)
@@ -207,11 +261,12 @@ class LinkResolver(
                     finalUrl = response.request.url.toString(),
                     fileName = headerName,
                     contentLength = length,
-                    acceptRanges = ranges
+                    acceptRanges = ranges,
+                    isHtml = isHtml
                 )
             }
         } catch (_: Exception) {
-            ProbeResult(url, null, -1L, false)
+            ProbeResult(url, null, -1L, false, false)
         }
     }
 }
