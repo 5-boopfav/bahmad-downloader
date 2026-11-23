@@ -4,6 +4,9 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
+import android.webkit.WebChromeClient
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.BorderStroke
@@ -32,6 +35,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.FileProvider
 import com.bahmad.downloader.engine.*
 import com.bahmad.downloader.service.DownloadForegroundService
@@ -71,6 +75,20 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private fun isVideoPageUrl(url: String): Boolean {
+    val lower = url.trim().lowercase()
+    val videoHosts = listOf(
+        "dailymotion.com", "dai.ly",
+        "youtube.com", "youtu.be",
+        "tiktok.com",
+        "instagram.com",
+        "facebook.com", "fb.watch",
+        "twitter.com", "x.com",
+        "vimeo.com", "twitch.tv"
+    )
+    return videoHosts.any { lower.contains(it) }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun BahmadMainScreen(initialSharedUrl: String?) {
@@ -84,12 +102,13 @@ fun BahmadMainScreen(initialSharedUrl: String?) {
     var resolvedInfo by remember { mutableStateOf<ResolvedLinkInfo?>(null) }
     var selectedFormat by remember { mutableStateOf("أعلى سرعة (مباشر)") }
     var statusMessage by remember { mutableStateOf<String?>(null) }
+    var browserUrl by remember { mutableStateOf<String?>(null) }
 
     val tasks by BahmadDownloadManager.tasks.collectAsState()
 
     val quickPlatforms = listOf(
-        "Google Drive", "YouTube", "TikTok", "Instagram",
-        "X / Twitter", "Facebook", "Snapchat", "ملفات مباشرة"
+        "Dailymotion", "Google Drive", "YouTube", "TikTok",
+        "Instagram", "X / Twitter", "Facebook", "ملفات مباشرة"
     )
 
     fun analyzeAndOpenSheet(targetUrl: String) {
@@ -98,6 +117,13 @@ fun BahmadMainScreen(initialSharedUrl: String?) {
             statusMessage = "الصق رابطاً أولاً لبدء التحميل"
             return
         }
+
+        if (isVideoPageUrl(trimmed)) {
+            statusMessage = null
+            browserUrl = trimmed
+            return
+        }
+
         isResolving = true
         statusMessage = null
         scope.launch {
@@ -112,6 +138,24 @@ fun BahmadMainScreen(initialSharedUrl: String?) {
         if (!initialSharedUrl.isNullOrBlank()) {
             analyzeAndOpenSheet(initialSharedUrl)
         }
+    }
+
+    if (browserUrl != null) {
+        BahmadWebBrowserView(
+            initialUrl = browserUrl!!,
+            onClose = { browserUrl = null },
+            onDownloadCurrentUrl = { currentPageUrl ->
+                browserUrl = null
+                isResolving = true
+                scope.launch {
+                    val info = withContext(Dispatchers.IO) { resolver.resolve(currentPageUrl) }
+                    isResolving = false
+                    resolvedInfo = info
+                    selectedFormat = info.suggestedFormats.firstOrNull() ?: "أعلى سرعة (مباشر)"
+                }
+            }
+        )
+        return
     }
 
     Scaffold(
@@ -147,7 +191,7 @@ fun BahmadMainScreen(initialSharedUrl: String?) {
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                text = "محمل فائق السرعة • جميع الروابط والملفات",
+                                text = "متصفح داخلي + محمل فائق السرعة",
                                 color = BahmadTextMuted,
                                 fontSize = 11.sp
                             )
@@ -327,7 +371,30 @@ fun BahmadMainScreen(initialSharedUrl: String?) {
                                 } else {
                                     Icon(Icons.Rounded.RocketLaunch, contentDescription = null)
                                     Spacer(modifier = Modifier.width(8.dp))
-                                    Text("فحص وتحميل فوري", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                                    Text("فحص أو فتح في المتصفح", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                                }
+                            }
+
+                            if (urlInput.isNotBlank()) {
+                                OutlinedButton(
+                                    onClick = { browserUrl = urlInput.trim() },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(44.dp),
+                                    shape = RoundedCornerShape(14.dp),
+                                    border = BorderStroke(1.dp, BahmadGold.copy(alpha = 0.6f))
+                                ) {
+                                    Icon(
+                                        Icons.Rounded.Public,
+                                        contentDescription = null,
+                                        tint = BahmadGoldLight
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        "فتح الرابط في المتصفح الداخلي",
+                                        color = BahmadGoldLight,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
                                 }
                             }
 
@@ -353,7 +420,7 @@ fun BahmadMainScreen(initialSharedUrl: String?) {
                                 shape = RoundedCornerShape(16.dp),
                                 border = BorderStroke(1.dp, Color(0xFF262C38)),
                                 modifier = Modifier.clickable {
-                                    statusMessage = "تم اختيار ($platform) — الصق الرابط أعلاه للتحميل الفوري"
+                                    statusMessage = "تم اختيار ($platform) — الصق الرابط أعلاه للفتح أو التحميل"
                                 }
                             ) {
                                 Row(
@@ -392,13 +459,13 @@ fun BahmadMainScreen(initialSharedUrl: String?) {
                             verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             Text(
-                                text = "لماذا بحمد أسرع؟",
+                                text = "كيف يعمل بحمد الآن؟",
                                 color = BahmadGoldLight,
                                 fontSize = 14.sp,
                                 fontWeight = FontWeight.Bold
                             )
-                            Text("• تقسيم الملفات الكبيرة إلى مسارات متوازية لرفع السرعة.", color = BahmadTextMuted, fontSize = 12.sp)
-                            Text("• دعم روابط Google Drive والملفات المباشرة والوسائط.", color = BahmadTextMuted, fontSize = 12.sp)
+                            Text("• روابط الفيديو والمواقع تفتح داخل المتصفح الداخلي لتشغيلها وتصفحها بسهولة.", color = BahmadTextMuted, fontSize = 12.sp)
+                            Text("• الملفات المباشرة وروابط Google Drive تتحمل عبر محرك السرعة المتوازي.", color = BahmadTextMuted, fontSize = 12.sp)
                             Text("• استمرار التحميل في الخلفية مع إشعارات فورية.", color = BahmadTextMuted, fontSize = 12.sp)
                         }
                     }
@@ -593,6 +660,106 @@ fun BahmadMainScreen(initialSharedUrl: String?) {
                     Spacer(modifier = Modifier.height(16.dp))
                 }
             }
+        }
+    }
+}
+
+@Composable
+fun BahmadWebBrowserView(
+    initialUrl: String,
+    onClose: () -> Unit,
+    onDownloadCurrentUrl: (String) -> Unit
+) {
+    var currentUrl by remember { mutableStateOf(initialUrl) }
+    var pageTitle by remember { mutableStateOf("متصفح بحمد") }
+    var webViewRef by remember { mutableStateOf<WebView?>(null) }
+
+    Surface(
+        color = BahmadBgDark,
+        modifier = Modifier.fillMaxSize()
+    ) {
+        Column(modifier = Modifier.fillMaxSize()) {
+            Surface(
+                color = BahmadCardDark,
+                shadowElevation = 4.dp
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 10.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    IconButton(onClick = onClose) {
+                        Icon(Icons.Rounded.ArrowForward, contentDescription = "رجوع", tint = BahmadTextWhite)
+                    }
+
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(horizontal = 6.dp)
+                    ) {
+                        Text(
+                            text = pageTitle,
+                            color = BahmadGoldLight,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 14.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = currentUrl,
+                            color = BahmadTextMuted,
+                            fontSize = 11.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+
+                    Button(
+                        onClick = { onDownloadCurrentUrl(currentUrl) },
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = BahmadGold,
+                            contentColor = BahmadBgDark
+                        ),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+                    ) {
+                        Icon(Icons.Rounded.Download, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("تحميل", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+
+            AndroidView(
+                modifier = Modifier.fillMaxSize(),
+                factory = { ctx ->
+                    WebView(ctx).apply {
+                        settings.javaScriptEnabled = true
+                        settings.domStorageEnabled = true
+                        settings.mediaPlaybackRequiresUserGesture = false
+                        webChromeClient = object : WebChromeClient() {
+                            override fun onReceivedTitle(view: WebView?, title: String?) {
+                                super.onReceivedTitle(view, title)
+                                if (!title.isNullOrBlank()) {
+                                    pageTitle = title
+                                }
+                            }
+                        }
+                        webViewClient = object : WebViewClient() {
+                            override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
+                                super.doUpdateVisitedHistory(view, url, isReload)
+                                if (!url.isNullOrBlank()) {
+                                    currentUrl = url
+                                }
+                            }
+                        }
+                        loadUrl(initialUrl)
+                        webViewRef = this
+                    }
+                }
+            )
         }
     }
 }
