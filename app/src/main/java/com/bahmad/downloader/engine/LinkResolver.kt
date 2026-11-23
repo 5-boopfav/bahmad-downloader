@@ -4,14 +4,6 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
-import org.schabi.newpipe.extractor.NewPipe
-import org.schabi.newpipe.extractor.ServiceList
-import org.schabi.newpipe.extractor.downloader.Downloader
-import org.schabi.newpipe.extractor.downloader.Request as NpRequest
-import org.schabi.newpipe.extractor.downloader.Response as NpResponse
-import org.schabi.newpipe.extractor.exceptions.ExtractionException
-import org.schabi.newpipe.extractor.stream.StreamInfo
-import java.io.IOException
 import java.util.concurrent.TimeUnit
 
 data class ResolvedLinkInfo(
@@ -37,19 +29,6 @@ class LinkResolver(
     private val userAgent =
         "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
 
-    init {
-        ensureNewPipeInitialized()
-    }
-
-    private fun ensureNewPipeInitialized() {
-        try {
-            if (NewPipe.getDownloader() == null) {
-                NewPipe.init(OkHttpNewPipeDownloader(client, userAgent))
-            }
-        } catch (_: Exception) {
-        }
-    }
-
     fun resolve(rawInput: String): ResolvedLinkInfo {
         val cleanUrl = rawInput.trim()
         val lower = cleanUrl.lowercase()
@@ -61,9 +40,6 @@ class LinkResolver(
         if (lower.contains("drive.google.com")) {
             return resolveGoogleDrive(cleanUrl)
         }
-
-        // محاولة الاستخراج عبر NewPipeExtractor للمنصات المدعومة
-        tryExtractWithNewPipe(cleanUrl)?.let { return it }
 
         val probe = probeUrl(cleanUrl)
         val sourceName = detectSourceLabel(lower)
@@ -97,45 +73,6 @@ class LinkResolver(
             note = htmlNote,
             isHtmlPage = probe.isHtml
         )
-    }
-
-    private fun tryExtractWithNewPipe(url: String): ResolvedLinkInfo? {
-        return try {
-            ensureNewPipeInitialized()
-            val service = NewPipe.getServiceByUrl(url) ?: return null
-            val info = StreamInfo.getInfo(service, url)
-            val title = sanitizeFileName(info.name.ifBlank { "bahmad_stream" })
-
-            val bestVideo = info.videoStreams
-                .filter { !it.content.isNullOrBlank() }
-                .maxByOrNull { it.height }
-
-            val bestAudio = info.audioStreams
-                .filter { !it.content.isNullOrBlank() }
-                .maxByOrNull { it.averageBitrate }
-
-            val chosenUrl = bestVideo?.content ?: bestAudio?.content ?: return null
-            val isHls = chosenUrl.contains(".m3u8", ignoreCase = true) ||
-                bestVideo?.isVideoOnly == true
-
-            ResolvedLinkInfo(
-                originalUrl = url,
-                directDownloadUrl = chosenUrl,
-                fileName = "$title.${if (isHls) "m3u8" else "mp4"}",
-                sourceLabel = "${service.serviceInfo.name} (NewPipe)",
-                fileSizeBytes = -1L,
-                supportsRange = false,
-                suggestedFormats = listOf("MP4", "720p", "MP3"),
-                note = if (isHls) {
-                    "تم استخراج مسار بث عبر NewPipe؛ بعض الروابط المقسّمة تحتاج محرك دمج لتحويلها إلى MP4 كامل."
-                } else {
-                    "تم استخراج رابط وسائط عبر NewPipe."
-                },
-                isHtmlPage = false
-            )
-        } catch (_: Exception) {
-            null
-        }
     }
 
     private fun resolveGoogleDrive(url: String): ResolvedLinkInfo {
@@ -357,49 +294,6 @@ class LinkResolver(
             }
         } catch (_: Exception) {
             ProbeResult(url, null, -1L, false, false)
-        }
-    }
-}
-
-private class OkHttpNewPipeDownloader(
-    private val client: OkHttpClient,
-    private val defaultUserAgent: String
-) : Downloader() {
-
-    @Throws(IOException::class, ExtractionException::class)
-    override fun execute(request: NpRequest): NpResponse {
-        val builder = Request.Builder()
-            .url(request.url())
-            .method(request.httpMethod(), request.dataToSend()?.let { data ->
-                okhttp3.RequestBody.create(null, data)
-            })
-
-        var hasUserAgent = false
-        for ((key, values) in request.headers()) {
-            if (key.equals("User-Agent", ignoreCase = true)) {
-                hasUserAgent = true
-            }
-            for (v in values) {
-                builder.addHeader(key, v)
-            }
-        }
-        if (!hasUserAgent) {
-            builder.header("User-Agent", defaultUserAgent)
-        }
-
-        client.newCall(builder.build()).execute().use { resp ->
-            val responseBodyStr = resp.body?.string()
-            val headersMap = mutableMapOf<String, List<String>>()
-            for (name in resp.headers().names()) {
-                headersMap[name] = resp.headers(name)
-            }
-            return NpResponse(
-                resp.code,
-                resp.message,
-                headersMap,
-                responseBodyStr,
-                resp.request.url.toString()
-            )
         }
     }
 }
