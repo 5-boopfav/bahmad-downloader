@@ -1,0 +1,8 @@
+<resources>
+    <color name="bahmad_bg_dark">#0D0F13</color>
+    <color name="bahmad_card_dark">#161A21</color>
+    <color name="bahmad_gold">#D9AE38</color>
+    <color name="bahmad_gold_light">#F6D776</color>
+    <color name="bahmad_text_white">#F8F9FA</color>
+    <color name="bahmad_text_muted">#9BA3B4</color>
+</resources>
