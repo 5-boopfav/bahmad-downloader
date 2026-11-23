@@ -89,6 +89,12 @@ private fun isVideoPageUrl(url: String): Boolean {
     return videoHosts.any { lower.contains(it) }
 }
 
+private fun formatFileSize(bytes: Long): String {
+    if (bytes <= 0L) return "غير معروف مسبقاً"
+    val mb = bytes / (1024.0 * 1024.0)
+    return if (mb >= 1.0) String.format("%.1f MB", mb) else "${bytes / 1024L} KB"
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun BahmadMainScreen(initialSharedUrl: String?) {
@@ -144,11 +150,11 @@ fun BahmadMainScreen(initialSharedUrl: String?) {
         BahmadWebBrowserView(
             initialUrl = browserUrl!!,
             onClose = { browserUrl = null },
-            onDownloadCurrentUrl = { currentPageUrl ->
+            onDownloadCurrentUrl = { targetMediaOrPageUrl ->
                 browserUrl = null
                 isResolving = true
                 scope.launch {
-                    val info = withContext(Dispatchers.IO) { resolver.resolve(currentPageUrl) }
+                    val info = withContext(Dispatchers.IO) { resolver.resolve(targetMediaOrPageUrl) }
                     isResolving = false
                     resolvedInfo = info
                     selectedFormat = info.suggestedFormats.firstOrNull() ?: "أعلى سرعة (مباشر)"
@@ -464,8 +470,8 @@ fun BahmadMainScreen(initialSharedUrl: String?) {
                                 fontSize = 14.sp,
                                 fontWeight = FontWeight.Bold
                             )
-                            Text("• روابط الفيديو والمواقع تفتح داخل المتصفح الداخلي لتشغيلها وتصفحها بسهولة.", color = BahmadTextMuted, fontSize = 12.sp)
-                            Text("• الملفات المباشرة وروابط Google Drive تتحمل عبر محرك السرعة المتوازي.", color = BahmadTextMuted, fontSize = 12.sp)
+                            Text("• روابط الفيديو والمواقع تفتح داخل المتصفح الداخلي وتلتقط روابط الوسائط أثناء التشغيل.", color = BahmadTextMuted, fontSize = 12.sp)
+                            Text("• يفحص التطبيق نوع المحتوى (ملف مباشر vs صفحة ويب) قبل التحميل.", color = BahmadTextMuted, fontSize = 12.sp)
                             Text("• استمرار التحميل في الخلفية مع إشعارات فورية.", color = BahmadTextMuted, fontSize = 12.sp)
                         }
                     }
@@ -539,7 +545,7 @@ fun BahmadMainScreen(initialSharedUrl: String?) {
                                 ) {
                                     Text(
                                         text = when (task.status) {
-                                            DownloadStatus.COMPLETED -> "مكتمل • ${task.formatLabel}"
+                                            DownloadStatus.COMPLETED -> "مكتمل (${formatFileSize(task.downloadedBytes)}) • ${task.formatLabel}"
                                             DownloadStatus.PAUSED -> "متوقف مؤقتاً"
                                             DownloadStatus.FAILED -> "فشل التحميل"
                                             else -> "${(task.progress * 100).toInt()}% • ${engine.formatSpeed(task.speedBytesPerSec)}"
@@ -617,10 +623,25 @@ fun BahmadMainScreen(initialSharedUrl: String?) {
                         overflow = TextOverflow.Ellipsis
                     )
                     Text(
-                        text = "المصدر: ${info.sourceLabel} • الحجم: ${if (info.fileSizeBytes > 0) "${info.fileSizeBytes / (1024 * 1024)} MB" else "غير محدد"}",
+                        text = "المصدر: ${info.sourceLabel} • الحجم: ${formatFileSize(info.fileSizeBytes)}",
                         color = BahmadTextMuted,
                         fontSize = 12.sp
                     )
+
+                    info.note?.let { noteText ->
+                        Surface(
+                            color = BahmadGold.copy(alpha = 0.12f),
+                            shape = RoundedCornerShape(12.dp),
+                            border = BorderStroke(1.dp, BahmadGold.copy(alpha = 0.35f))
+                        ) {
+                            Text(
+                                text = noteText,
+                                color = BahmadGoldLight,
+                                fontSize = 12.sp,
+                                modifier = Modifier.padding(10.dp)
+                            )
+                        }
+                    }
 
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         items(info.suggestedFormats) { fmt ->
@@ -672,7 +693,7 @@ fun BahmadWebBrowserView(
 ) {
     var currentUrl by remember { mutableStateOf(initialUrl) }
     var pageTitle by remember { mutableStateOf("متصفح بحمد") }
-    var webViewRef by remember { mutableStateOf<WebView?>(null) }
+    var detectedMediaUrl by remember { mutableStateOf<String?>(null) }
 
     Surface(
         color = BahmadBgDark,
@@ -683,51 +704,71 @@ fun BahmadWebBrowserView(
                 color = BahmadCardDark,
                 shadowElevation = 4.dp
             ) {
-                Row(
+                Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(horizontal = 10.dp, vertical = 10.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    IconButton(onClick = onClose) {
-                        Icon(Icons.Rounded.ArrowForward, contentDescription = "رجوع", tint = BahmadTextWhite)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        IconButton(onClick = onClose) {
+                            Icon(Icons.Rounded.ArrowForward, contentDescription = "رجوع", tint = BahmadTextWhite)
+                        }
+
+                        Column(
+                            modifier = Modifier
+                                .weight(1f)
+                                .padding(horizontal = 6.dp)
+                        ) {
+                            Text(
+                                text = pageTitle,
+                                color = BahmadGoldLight,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 14.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = currentUrl,
+                                color = BahmadTextMuted,
+                                fontSize = 11.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+
+                        Button(
+                            onClick = { onDownloadCurrentUrl(detectedMediaUrl ?: currentUrl) },
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = BahmadGold,
+                                contentColor = BahmadBgDark
+                            ),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+                        ) {
+                            Icon(Icons.Rounded.Download, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                if (detectedMediaUrl != null) "تحميل الوسائط" else "تحميل",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
                     }
 
-                    Column(
-                        modifier = Modifier
-                            .weight(1f)
-                            .padding(horizontal = 6.dp)
-                    ) {
+                    detectedMediaUrl?.let { media ->
                         Text(
-                            text = pageTitle,
+                            text = "تم التقاط رابط وسائط: $media",
                             color = BahmadGoldLight,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 14.sp,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        Text(
-                            text = currentUrl,
-                            color = BahmadTextMuted,
                             fontSize = 11.sp,
                             maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(horizontal = 8.dp)
                         )
-                    }
-
-                    Button(
-                        onClick = { onDownloadCurrentUrl(currentUrl) },
-                        shape = RoundedCornerShape(12.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = BahmadGold,
-                            contentColor = BahmadBgDark
-                        ),
-                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
-                    ) {
-                        Icon(Icons.Rounded.Download, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("تحميل", fontSize = 12.sp, fontWeight = FontWeight.Bold)
                     }
                 }
             }
@@ -754,9 +795,24 @@ fun BahmadWebBrowserView(
                                     currentUrl = url
                                 }
                             }
+
+                            override fun onLoadResource(view: WebView?, resUrl: String?) {
+                                super.onLoadResource(view, resUrl)
+                                if (!resUrl.isNullOrBlank()) {
+                                    val lower = resUrl.lowercase()
+                                    if (
+                                        lower.contains(".mp4") ||
+                                        lower.contains(".m3u8") ||
+                                        lower.contains(".mp3") ||
+                                        lower.contains(".m4a") ||
+                                        lower.contains(".webm")
+                                    ) {
+                                        detectedMediaUrl = resUrl
+                                    }
+                                }
+                            }
                         }
                         loadUrl(initialUrl)
-                        webViewRef = this
                     }
                 }
             )
