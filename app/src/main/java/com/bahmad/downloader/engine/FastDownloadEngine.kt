@@ -11,6 +11,8 @@ import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.Worker
 import androidx.work.WorkerParameters
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
@@ -63,38 +65,53 @@ object DownloaderEngineInitializer {
     }
 }
 
-object FastDownloadEngine {
+class FastDownloadEngine {
 
-    fun download(
+    suspend fun runDownload(
         context: Context,
-        url: String,
-        fileName: String = "bahmad_media_${System.currentTimeMillis()}.mp4",
-        format: String = "MP4 (أفضل جودة)",
-        onProgress: (Int) -> Unit = {}
-    ): DownloadOutcome {
-        onProgress(10)
-        val outcome = BahmadMediaDownloader.downloadAndSaveNow(
-            context = context,
-            url = url,
-            rawFileName = fileName,
-            selectedFormat = format
-        )
-        onProgress(if (outcome.success) 100 else 0)
-        return outcome
-    }
+        taskId: String,
+        onProgress: (
+            title: String,
+            percent: Int,
+            speedText: String,
+            completed: Boolean,
+            failed: Boolean
+        ) -> Unit
+    ) {
+        withContext(Dispatchers.IO) {
+            val parts = taskId.split("|")
+            val rawUrl = parts.getOrNull(0).orEmpty().trim()
+            val fileName = parts.getOrNull(1).orEmpty().ifBlank {
+                "bahmad_media_${System.currentTimeMillis()}.mp4"
+            }
+            val format = parts.getOrNull(2).orEmpty().ifBlank { "MP4 (أفضل جودة)" }
 
-    fun startDownload(
-        context: Context,
-        url: String,
-        fileName: String = "bahmad_media_${System.currentTimeMillis()}.mp4",
-        format: String = "MP4 (أفضل جودة)"
-    ): DownloadOutcome {
-        return BahmadMediaDownloader.downloadAndSaveNow(
-            context = context,
-            url = url,
-            rawFileName = fileName,
-            selectedFormat = format
-        )
+            withContext(Dispatchers.Main) {
+                onProgress(fileName, 15, "جاري الاتصال...", false, false)
+            }
+
+            val startNs = System.nanoTime()
+            val outcome = BahmadMediaDownloader.downloadAndSaveNow(
+                context = context,
+                url = rawUrl,
+                rawFileName = fileName,
+                selectedFormat = format
+            )
+            val elapsedSec = ((System.nanoTime() - startNs) / 1_000_000_000.0).coerceAtLeast(0.2)
+            val speedLabel = if (outcome.success) {
+                "${String.format("%.1f", 1.0 / elapsedSec)}x"
+            } else {
+                "0 KB/s"
+            }
+
+            withContext(Dispatchers.Main) {
+                if (outcome.success) {
+                    onProgress(fileName, 100, speedLabel, true, false)
+                } else {
+                    onProgress(fileName, 0, speedLabel, false, true)
+                }
+            }
+        }
     }
 }
 
