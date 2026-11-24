@@ -65,6 +65,7 @@ import com.bahmad.downloader.engine.DownloaderEngineInitializer
 import com.bahmad.downloader.engine.LinkResolver
 import com.bahmad.downloader.engine.ResolvedLinkInfo
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -127,30 +128,37 @@ private fun BahmadMainScreen() {
         downloadLogs.add("قيد التنزيل في الخلفية: ${info.fileName} ($format)")
         statusMessage = "تمت جدولة التحميل في الخلفية: ${info.fileName}"
 
-        WorkManager.getInstance(context.applicationContext)
-            .getWorkInfoByIdLiveData(workId)
-            .observeForever { workInfo ->
-                if (workInfo == null) return@observeForever
-                when (workInfo.state) {
-                    WorkInfo.State.SUCCEEDED -> {
-                        val msg = workInfo.outputData.getString(BahmadDownloadWorker.KEY_RESULT_MESSAGE)
-                            ?: "تم حفظ الملف في مجلد التنزيلات"
-                        statusMessage = msg
-                        if (logIndex < downloadLogs.size) {
-                            downloadLogs[logIndex] = "مكتمل: $msg"
-                        }
-                    }
-                    WorkInfo.State.FAILED -> {
-                        val msg = workInfo.outputData.getString(BahmadDownloadWorker.KEY_RESULT_MESSAGE)
-                            ?: "فشل تنزيل الملف"
-                        statusMessage = msg
-                        if (logIndex < downloadLogs.size) {
-                            downloadLogs[logIndex] = "فشل: $msg"
-                        }
-                    }
-                    else -> Unit
+        scope.launch(Dispatchers.IO) {
+            val wm = WorkManager.getInstance(context.applicationContext)
+            repeat(120) {
+                val infoList = try {
+                    wm.getWorkInfosForUniqueWork("bahmad_dl_$workId").get()
+                } catch (_: Exception) {
+                    emptyList<WorkInfo>()
                 }
+                val current = infoList.firstOrNull()
+                if (current != null && (current.state == WorkInfo.State.SUCCEEDED || current.state == WorkInfo.State.FAILED)) {
+                    val msg = current.outputData.getString(BahmadDownloadWorker.KEY_RESULT_MESSAGE)
+                        ?: if (current.state == WorkInfo.State.SUCCEEDED) {
+                            "تم حفظ الملف في مجلد التنزيلات"
+                        } else {
+                            "فشل تنزيل الملف"
+                        }
+                    withContext(Dispatchers.Main) {
+                        statusMessage = msg
+                        if (logIndex < downloadLogs.size) {
+                            downloadLogs[logIndex] = if (current.state == WorkInfo.State.SUCCEEDED) {
+                                "مكتمل: $msg"
+                            } else {
+                                "فشل: $msg"
+                            }
+                        }
+                    }
+                    return@launch
+                }
+                delay(1000L)
             }
+        }
     }
 
     Scaffold(
