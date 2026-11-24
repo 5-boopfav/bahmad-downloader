@@ -13,6 +13,7 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
@@ -25,7 +26,13 @@ android {
         }
     }
 
+    buildFeatures {
+        compose = true
+        buildConfig = true
+    }
+
     compileOptions {
+        isCoreLibraryDesugaringEnabled = true
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
@@ -34,16 +41,20 @@ android {
         jvmTarget = "17"
     }
 
-    buildFeatures {
-        compose = true
-    }
-
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.14"
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
     }
 }
 
 dependencies {
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs_nio:2.1.5")
+
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.4")
     implementation("androidx.activity:activity-compose:1.9.1")
