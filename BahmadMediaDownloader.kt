@@ -5,13 +5,16 @@ import android.content.Context
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
-import com.yausername.youtubedl_android.YoutubeDL
-import com.yausername.youtubedl_android.YoutubeDLRequest
+import androidx.work.Data
+import androidx.work.ExistingWorkPolicy
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkManager
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
 import java.io.FileInputStream
 import java.io.OutputStream
+import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 data class DownloadOutcome(
@@ -28,38 +31,54 @@ object BahmadMediaDownloader {
         .followRedirects(true)
         .build()
 
-    fun downloadAndSave(
+    fun enqueueBackgroundDownload(
         context: Context,
         info: ResolvedLinkInfo,
+        selectedFormat: String
+    ): UUID {
+        DownloaderEngineInitializer.ensureInitialized(context)
+        val workId = UUID.randomUUID()
+        val inputData = Data.Builder()
+            .putString(BahmadDownloadWorker.KEY_URL, info.directDownloadUrl.ifBlank { info.originalUrl })
+            .putString(BahmadDownloadWorker.KEY_FILE_NAME, info.fileName)
+            .putString(BahmadDownloadWorker.KEY_FORMAT, selectedFormat)
+            .build()
+
+        val request = OneTimeWorkRequestBuilder<BahmadDownloadWorker>()
+            .setId(workId)
+            .setInputData(inputData)
+            .build()
+
+        WorkManager.getInstance(context.applicationContext)
+            .enqueueUniqueWork("bahmad_dl_${workId}", ExistingWorkPolicy.REPLACE, request)
+
+        return workId
+    }
+
+    fun downloadAndSaveNow(
+        context: Context,
+        url: String,
+        rawFileName: String,
         selectedFormat: String
     ): DownloadOutcome {
         DownloaderEngineInitializer.ensureInitialized(context)
 
-        val isAudioOnly = selectedFormat.contains("MP3", ignoreCase = true) ||
-            selectedFormat.contains("صوت", ignoreCase = true)
-
-        val targetUrl = info.originalUrl.ifBlank { info.directDownloadUrl }
-        val baseTitle = sanitizeBaseName(info.fileName)
-
-        // 1. محاولة التنزيل عبر YoutubeDL إذا كان الرابط يدعم الاستخراج
-        if (targetUrl.startsWith("http://") || targetUrl.startsWith("https://")) {
-            val ytResult = tryDownloadWithYoutubeDL(context, targetUrl, baseTitle, selectedFormat, isAudioOnly)
-            if (ytResult != null) return ytResult
-        }
-
-        // 2. مسار احتياطي للروابط المباشرة عبر OkHttp + الحفظ في Downloads / MediaStore
-        val directUrl = info.directDownloadUrl.trim()
-        if (!directUrl.startsWith("http://") && !directUrl.startsWith("https://")) {
+        val cleanUrl = url.trim()
+        if (!cleanUrl.startsWith("http://") && !cleanUrl.startsWith("https://")) {
             return DownloadOutcome(false, "الرابط غير صالح للتحميل المباشر.")
         }
 
+        val isAudioOnly = selectedFormat.contains("MP3", ignoreCase = true) ||
+            selectedFormat.contains("صوت", ignoreCase = true)
+
+        val baseTitle = sanitizeBaseName(rawFileName)
+        val ext = if (isAudioOnly) "mp3" else resolveExtension(rawFileName, cleanUrl)
         val tempDir = File(context.cacheDir, "bahmad_downloads").apply { mkdirs() }
-        val ext = if (isAudioOnly) "mp3" else resolveExtension(info.fileName, directUrl)
         val tempFile = File(tempDir, "${baseTitle}_${System.currentTimeMillis()}.$ext")
 
         return try {
             val req = Request.Builder()
-                .url(directUrl)
+                .url(cleanUrl)
                 .header(
                     "User-Agent",
                     "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
@@ -68,9 +87,9 @@ object BahmadMediaDownloader {
 
             httpClient.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) {
-                    return DownloadOutcome(false, "فشل التحميل المباشر (رمز الاستجابة: ${resp.code}).")
+                    return DownloadOutcome(false, "فشل التنزيل (رمز الاستجابة: ${resp.code}).")
                 }
-                val body = resp.body ?: return DownloadOutcome(false, "تعذر قراءة بيانات الملف من الخادم.")
+                val body = resp.body ?: return DownloadOutcome(false, "تعذر قراءة بيانات الملف.")
                 val contentType = resp.header("Content-Type")?.lowercase().orEmpty()
                 if (contentType.contains("text/html")) {
                     tempFile.delete()
@@ -107,66 +126,7 @@ object BahmadMediaDownloader {
             }
         } catch (e: Exception) {
             tempFile.delete()
-            DownloadOutcome(false, "حدث خطأ أثناء التحميل: ${e.message ?: "خطأ غير معروف"}")
-        }
-    }
-
-    private fun tryDownloadWithYoutubeDL(
-        context: Context,
-        url: String,
-        baseTitle: String,
-        selectedFormat: String,
-        isAudioOnly: Boolean
-    ): DownloadOutcome? {
-        return try {
-            val workDir = File(context.cacheDir, "ydl_work_${System.currentTimeMillis()}").apply { mkdirs() }
-            val request = YoutubeDLRequest(url).apply {
-                addOption("-o", File(workDir, "$baseTitle.%(ext)s").absolutePath)
-                addOption("--no-playlist")
-                addOption("--no-warnings")
-
-                if (isAudioOnly) {
-                    addOption("-x")
-                    addOption("--audio-format", "mp3")
-                } else {
-                    val heightMatch = Regex("(\\d{3,4})p").find(selectedFormat)?.groupValues?.get(1)
-                    if (heightMatch != null) {
-                        addOption("-f", "bv*[height<=$heightMatch]+ba/b[height<=$heightMatch]/bv*+ba/b")
-                    } else {
-                        addOption("-f", "bv*+ba/b")
-                    }
-                    addOption("--merge-output-format", "mp4")
-                }
-            }
-
-            YoutubeDL.getInstance().execute(request, null, null)
-
-            val outputFile = workDir.listFiles()
-                ?.filter { it.isFile && it.length() > 0L }
-                ?.maxByOrNull { it.lastModified() }
-
-            if (outputFile == null) {
-                workDir.deleteRecursively()
-                return null
-            }
-
-            val finalExt = outputFile.extension.ifBlank { if (isAudioOnly) "mp3" else "mp4" }
-            val finalName = "$baseTitle.$finalExt"
-            val savedPath = saveFileToPublicDownloads(
-                context = context,
-                sourceFile = outputFile,
-                fileName = finalName,
-                mimeType = guessMimeType(finalExt)
-            )
-            workDir.deleteRecursively()
-
-            if (savedPath != null) {
-                DownloadOutcome(true, "تم حفظ الملف في مجلد التنزيلات: $savedPath", savedPath)
-            } else {
-                DownloadOutcome(false, "تم تنزيل الملف ولكن تعذر نقله إلى مجلد التنزيلات.")
-            }
-        } catch (_: Throwable) {
-            null
+            DownloadOutcome(false, "حدث خطأ أثناء التنزيل: ${e.message ?: "خطأ غير معروف"}")
         }
     }
 
