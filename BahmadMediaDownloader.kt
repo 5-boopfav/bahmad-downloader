@@ -82,8 +82,12 @@ object BahmadMediaDownloader {
     ): UUID {
         DownloaderEngineInitializer.ensureInitialized(context)
         val workId = UUID.randomUUID()
+        val targetUrl = info.directDownloadUrl.ifBlank { info.originalUrl }
+        val refererUrl = info.originalUrl.takeIf { it.startsWith("http") && it != targetUrl }.orEmpty()
+
         val inputData = Data.Builder()
-            .putString(BahmadDownloadWorker.KEY_URL, info.directDownloadUrl.ifBlank { info.originalUrl })
+            .putString(BahmadDownloadWorker.KEY_URL, targetUrl)
+            .putString(BahmadDownloadWorker.KEY_REFERER, refererUrl)
             .putString(BahmadDownloadWorker.KEY_FILE_NAME, info.fileName)
             .putString(BahmadDownloadWorker.KEY_FORMAT, selectedFormat)
             .build()
@@ -103,7 +107,8 @@ object BahmadMediaDownloader {
         context: Context,
         url: String,
         rawFileName: String,
-        selectedFormat: String
+        selectedFormat: String,
+        refererUrl: String = ""
     ): DownloadOutcome {
         DownloaderEngineInitializer.ensureInitialized(context)
 
@@ -121,13 +126,16 @@ object BahmadMediaDownloader {
         val tempFile = File(tempDir, "${baseTitle}_${System.currentTimeMillis()}.$ext")
 
         return try {
-            val req = Request.Builder()
+            val reqBuilder = Request.Builder()
                 .url(cleanUrl)
                 .header("User-Agent", USER_AGENT)
                 .header("Accept", "*/*")
-                .build()
 
-            httpClient.newCall(req).execute().use { resp ->
+            if (refererUrl.startsWith("http://") || refererUrl.startsWith("https://")) {
+                reqBuilder.header("Referer", refererUrl)
+            }
+
+            httpClient.newCall(reqBuilder.build()).execute().use { resp ->
                 if (!resp.isSuccessful) {
                     return DownloadOutcome(false, "فشل التنزيل (رمز الاستجابة: ${resp.code}).")
                 }
@@ -139,10 +147,19 @@ object BahmadMediaDownloader {
 
                 if (isPlaylist) {
                     val playlistBody = body.string()
-                    val downloadedSegments = downloadHlsSegments(cleanUrl, playlistBody, tempFile)
+                    val downloadedSegments = downloadHlsSegments(
+                        playlistUrl = cleanUrl,
+                        playlistContent = playlistBody,
+                        outputFile = tempFile,
+                        refererUrl = refererUrl,
+                        depth = 0
+                    )
                     if (!downloadedSegments) {
                         tempFile.delete()
-                        return DownloadOutcome(false, "تعذر تجميع مقاطع البث المباشر بالكامل.")
+                        return DownloadOutcome(
+                            false,
+                            "تعذر تحميل مقاطع البث المباشر (قد يكون البث محمياً أو يتطلب محرك yt-dlp)."
+                        )
                     }
                 } else {
                     if (contentType.contains("text/html")) {
@@ -188,22 +205,27 @@ object BahmadMediaDownloader {
     private fun downloadHlsSegments(
         playlistUrl: String,
         playlistContent: String,
-        outputFile: File
+        outputFile: File,
+        refererUrl: String,
+        depth: Int
     ): Boolean {
+        if (depth > 3 || playlistContent.isBlank()) return false
+
         val lines = playlistContent.lines().map { it.trim() }.filter { it.isNotEmpty() }
         val hasNestedVariant = lines.any { it.startsWith("#EXT-X-STREAM-INF", ignoreCase = true) }
 
         if (hasNestedVariant) {
             val bestChild = LinkResolver.resolve(playlistUrl).directDownloadUrl
             if (bestChild.isNotBlank() && bestChild != playlistUrl) {
-                val childReq = Request.Builder()
+                val childReqBuilder = Request.Builder()
                     .url(bestChild)
                     .header("User-Agent", USER_AGENT)
-                    .build()
-                httpClient.newCall(childReq).execute().use { childResp ->
+                if (refererUrl.isNotBlank()) childReqBuilder.header("Referer", refererUrl)
+
+                httpClient.newCall(childReqBuilder.build()).execute().use { childResp ->
                     if (!childResp.isSuccessful) return false
                     val childText = childResp.body?.string().orEmpty()
-                    return downloadHlsSegments(bestChild, childText, outputFile)
+                    return downloadHlsSegments(bestChild, childText, outputFile, refererUrl, depth + 1)
                 }
             }
         }
@@ -214,22 +236,32 @@ object BahmadMediaDownloader {
 
         if (segmentUrls.isEmpty()) return false
 
+        var writtenBytes = 0L
         outputFile.outputStream().use { out ->
             for (segUrl in segmentUrls) {
-                val segReq = Request.Builder()
+                val segReqBuilder = Request.Builder()
                     .url(segUrl)
                     .header("User-Agent", USER_AGENT)
-                    .build()
-                httpClient.newCall(segReq).execute().use { segResp ->
-                    if (!segResp.isSuccessful) return false
-                    val segBody = segResp.body ?: return false
-                    segBody.byteStream().use { input ->
-                        input.copyTo(out, bufferSize = 32 * 1024)
+                if (refererUrl.isNotBlank()) segReqBuilder.header("Referer", refererUrl)
+
+                try {
+                    httpClient.newCall(segReqBuilder.build()).execute().use { segResp ->
+                        if (segResp.isSuccessful) {
+                            val segBody = segResp.body
+                            if (segBody != null) {
+                                val bytes = segBody.byteStream().use { input ->
+                                    input.copyTo(out, bufferSize = 32 * 1024)
+                                }
+                                writtenBytes += bytes
+                            }
+                        }
                     }
+                } catch (_: Exception) {
+                    // تجاهل مقطع مفرد متعثر إذا أمكن إكمال الباقي
                 }
             }
         }
-        return outputFile.exists() && outputFile.length() > 0L
+        return writtenBytes > 0L && outputFile.exists() && outputFile.length() > 0L
     }
 
     private fun resolveUri(baseUrl: String, candidate: String): String {
@@ -329,6 +361,7 @@ class BahmadDownloadWorker(
 
     companion object {
         const val KEY_URL = "url"
+        const val KEY_REFERER = "referer"
         const val KEY_FILE_NAME = "file_name"
         const val KEY_FORMAT = "format"
         const val KEY_RESULT_MESSAGE = "result_message"
@@ -336,6 +369,7 @@ class BahmadDownloadWorker(
 
     override fun doWork(): Result {
         val url = inputData.getString(KEY_URL).orEmpty()
+        val referer = inputData.getString(KEY_REFERER).orEmpty()
         val fileName = inputData.getString(KEY_FILE_NAME).orEmpty().ifBlank {
             "bahmad_media_${System.currentTimeMillis()}.mp4"
         }
@@ -345,7 +379,8 @@ class BahmadDownloadWorker(
             context = applicationContext,
             url = url,
             rawFileName = fileName,
-            selectedFormat = format
+            selectedFormat = format,
+            refererUrl = referer
         )
 
         val output = Data.Builder()
