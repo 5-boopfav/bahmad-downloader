@@ -1,472 +1,339 @@
-package com.bahmad.downloader
+package com.bahmad.downloader.engine
 
-import android.annotation.SuppressLint
-import android.app.DownloadManager
-import android.content.Context
-import android.net.Uri
-import android.os.Bundle
-import android.os.Environment
-import android.webkit.WebResourceRequest
-import android.webkit.WebView
-import android.webkit.WebViewClient
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
-import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.Close
-import androidx.compose.material.icons.rounded.Download
-import androidx.compose.material.icons.rounded.Folder
-import androidx.compose.material.icons.rounded.Public
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilterChip
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.NavigationBar
-import androidx.compose.material3.NavigationBarItem
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
-import androidx.compose.material3.darkColorScheme
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.viewinterop.AndroidView
-import com.bahmad.downloader.engine.LinkResolver
-import com.bahmad.downloader.engine.ResolvedLinkInfo
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import com.yausername.youtubedl_android.YoutubeDL
+import com.yausername.youtubedl_android.YoutubeDLRequest
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import org.json.JSONArray
+import org.json.JSONObject
+import java.util.concurrent.TimeUnit
 
-private val BahmadBgDark = Color(0xFF0E1116)
-private val BahmadSurface = Color(0xFF171C24)
-private val BahmadGold = Color(0xFFE5B84B)
+data class ResolvedLinkInfo(
+    val originalUrl: String,
+    val directDownloadUrl: String,
+    val fileName: String,
+    val sourceLabel: String,
+    val fileSizeBytes: Long,
+    val supportsRange: Boolean,
+    val suggestedFormats: List<String>,
+    val note: String? = null,
+    val isHtmlPage: Boolean = false
+)
 
-class MainActivity : ComponentActivity() {
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        setContent {
-            MaterialTheme(
-                colorScheme = darkColorScheme(
-                    primary = BahmadGold,
-                    onPrimary = BahmadBgDark,
-                    background = BahmadBgDark,
-                    surface = BahmadSurface
-                )
-            ) {
-                Surface(
-                    modifier = Modifier.fillMaxSize(),
-                    color = BahmadBgDark
-                ) {
-                    BahmadMainScreen()
-                }
-            }
-        }
-    }
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun BahmadMainScreen() {
-    val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-    val resolver = remember { LinkResolver() }
-
-    var urlInput by remember { mutableStateOf("") }
-    var isChecking by remember { mutableStateOf(false) }
-    var statusMessage by remember { mutableStateOf<String?>(null) }
-    var resolvedInfo by remember { mutableStateOf<ResolvedLinkInfo?>(null) }
-    var selectedFormat by remember { mutableStateOf("MP4 (ملف مباشر)") }
-    var browserUrl by remember { mutableStateOf<String?>(null) }
-    var capturedMediaUrl by remember { mutableStateOf<String?>(null) }
-    var selectedTab by remember { mutableIntStateOf(0) }
-
-    Scaffold(
-        containerColor = BahmadBgDark,
-        topBar = {
-            TopAppBar(
-                title = {
-                    Text(
-                        text = "بحمد للتحميل",
-                        fontWeight = FontWeight.Bold,
-                        color = BahmadGold
-                    )
-                }
-            )
-        },
-        bottomBar = {
-            NavigationBar(containerColor = BahmadSurface) {
-                NavigationBarItem(
-                    selected = selectedTab == 0,
-                    onClick = { selectedTab = 0 },
-                    icon = { Icon(Icons.Rounded.Download, contentDescription = null) },
-                    label = { Text("الرئيسية") }
-                )
-                NavigationBarItem(
-                    selected = selectedTab == 1,
-                    onClick = { selectedTab = 1 },
-                    icon = { Icon(Icons.Rounded.Folder, contentDescription = null) },
-                    label = { Text("التحميلات") }
-                )
-                NavigationBarItem(
-                    selected = selectedTab == 2,
-                    onClick = {
-                        selectedTab = 2
-                        if (browserUrl == null) {
-                            browserUrl = if (urlInput.startsWith("http")) urlInput.trim() else "https://www.dailymotion.com"
-                        }
-                    },
-                    icon = { Icon(Icons.Rounded.Public, contentDescription = null) },
-                    label = { Text("المتصفح") }
-                )
-            }
-        }
-    ) { innerPadding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding)
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            when (selectedTab) {
-                0 -> {
-                    OutlinedTextField(
-                        value = urlInput,
-                        onValueChange = { urlInput = it },
-                        label = { Text("الصق الرابط هنا") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Button(
-                            onClick = {
-                                val target = urlInput.trim()
-                                if (target.isNotEmpty() && !isChecking) {
-                                    isChecking = true
-                                    statusMessage = "جاري فحص الرابط واستخراج الوسائط..."
-                                    scope.launch {
-                                        val result = withContext(Dispatchers.IO) {
-                                            resolver.resolve(target)
-                                        }
-                                        isChecking = false
-                                        resolvedInfo = result
-                                        selectedFormat = result.suggestedFormats.firstOrNull() ?: "MP4"
-                                        statusMessage = result.note
-                                    }
-                                }
-                            },
-                            modifier = Modifier.weight(1f),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = BahmadGold,
-                                contentColor = BahmadBgDark
-                            )
-                        ) {
-                            Text(if (isChecking) "جاري الفحص..." else "فحص الرابط", fontWeight = FontWeight.Bold)
-                        }
-
-                        OutlinedButton(
-                            onClick = {
-                                val target = urlInput.trim().ifEmpty { "https://www.dailymotion.com" }
-                                browserUrl = if (target.startsWith("http")) target else "https://$target"
-                                selectedTab = 2
-                            }
-                        ) {
-                            Icon(Icons.Rounded.Public, contentDescription = null)
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("المتصفح")
-                        }
-                    }
-
-                    statusMessage?.let { msg ->
-                        Text(
-                            text = msg,
-                            color = Color(0xFFD0D6E0),
-                            style = MaterialTheme.typography.bodyMedium
-                        )
-                    }
-                }
-
-                1 -> {
-                    Text(
-                        text = "قائمة التحميلات",
-                        fontWeight = FontWeight.Bold,
-                        color = BahmadGold
-                    )
-                    Text(
-                        text = "يتم حفظ الملفات المباشرة في مجلد التنزيلات (Downloads) بالامتداد المناسب.",
-                        color = Color(0xFFB0B7C3)
-                    )
-                }
-
-                2 -> {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        OutlinedTextField(
-                            value = browserUrl ?: "",
-                            onValueChange = { browserUrl = it },
-                            label = { Text("عنوان الصفحة") },
-                            singleLine = true,
-                            modifier = Modifier.weight(1f)
-                        )
-                        IconButton(onClick = {
-                            browserUrl = null
-                            capturedMediaUrl = null
-                            selectedTab = 0
-                        }) {
-                            Icon(Icons.Rounded.Close, contentDescription = "إغلاق")
-                        }
-                    }
-
-                    capturedMediaUrl?.let { mediaUrl ->
-                        Button(
-                            onClick = {
-                                enqueueDirectDownload(
-                                    context = context,
-                                    url = mediaUrl,
-                                    fileName = "bahmad_captured_${System.currentTimeMillis()}.mp4",
-                                    format = "MP4 (ملتقط)"
-                                )
-                                selectedTab = 1
-                            },
-                            modifier = Modifier.fillMaxWidth(),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = BahmadGold,
-                                contentColor = BahmadBgDark
-                            )
-                        ) {
-                            Icon(Icons.Rounded.Download, contentDescription = null)
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("تحميل الوسائط الملتقطة", fontWeight = FontWeight.Bold)
-                        }
-                    }
-
-                    BahmadWebBrowserView(
-                        url = browserUrl ?: "https://www.dailymotion.com",
-                        onMediaDetected = { detected ->
-                            capturedMediaUrl = detected
-                        },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .weight(1f)
-                    )
-                }
-            }
-        }
-
-        val info = resolvedInfo
-        if (info != null) {
-            ModalBottomSheet(
-                onDismissRequest = { resolvedInfo = null },
-                containerColor = BahmadSurface
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 20.dp, vertical = 12.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    Text(
-                        text = info.fileName,
-                        fontWeight = FontWeight.Bold,
-                        color = Color.White
-                    )
-                    Text(
-                        text = "المصدر: ${info.sourceLabel}",
-                        color = Color(0xFFB0B7C3)
-                    )
-                    info.note?.let { note ->
-                        Text(
-                            text = note,
-                            color = BahmadGold,
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                    }
-
-                    if (!info.isHtmlPage && info.suggestedFormats.isNotEmpty()) {
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            info.suggestedFormats.forEach { fmt ->
-                                FilterChip(
-                                    selected = selectedFormat == fmt,
-                                    onClick = { selectedFormat = fmt },
-                                    label = { Text(fmt) }
-                                )
-                            }
-                        }
-                    }
-
-                    Button(
-                        onClick = {
-                            if (info.isHtmlPage) {
-                                browserUrl = info.originalUrl
-                                capturedMediaUrl = null
-                                resolvedInfo = null
-                                selectedTab = 2
-                            } else {
-                                enqueueDirectDownload(
-                                    context = context,
-                                    url = info.directDownloadUrl,
-                                    fileName = info.fileName,
-                                    format = selectedFormat
-                                )
-                                resolvedInfo = null
-                                selectedTab = 1
-                            }
-                        },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(50.dp),
-                        shape = RoundedCornerShape(14.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = BahmadGold,
-                            contentColor = BahmadBgDark
-                        )
-                    ) {
-                        Icon(
-                            imageVector = if (info.isHtmlPage) Icons.Rounded.Public else Icons.Rounded.Download,
-                            contentDescription = null
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = if (info.isHtmlPage) "افتح في المتصفح الداخلي" else "ابدأ التحميل الآن",
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.height(16.dp))
-                }
-            }
-        }
-    }
-}
-
-@SuppressLint("SetJavaScriptEnabled")
-@Composable
-private fun BahmadWebBrowserView(
-    url: String,
-    onMediaDetected: (String) -> Unit,
-    modifier: Modifier = Modifier
+class LinkResolver(
+    private val client: OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .followRedirects(true)
+        .build()
 ) {
-    Box(modifier = modifier.background(Color.Black)) {
-        AndroidView(
-            factory = { ctx ->
-                WebView(ctx).apply {
-                    settings.javaScriptEnabled = true
-                    settings.domStorageEnabled = true
-                    webViewClient = object : WebViewClient() {
-                        override fun onLoadResource(view: WebView?, resUrl: String?) {
-                            val candidate = resUrl.orEmpty()
-                            val lower = candidate.lowercase()
-                            if (
-                                lower.contains(".mp4") ||
-                                lower.contains(".m3u8") ||
-                                lower.contains(".mp3") ||
-                                lower.contains("videoplayback")
-                            ) {
-                                onMediaDetected(candidate)
-                            }
-                        }
 
-                        override fun shouldOverrideUrlLoading(
-                            view: WebView?,
-                            request: WebResourceRequest?
-                        ): Boolean = false
-                    }
-                    loadUrl(url)
-                }
-            },
-            update = { webView ->
-                if (webView.url != url && url.isNotBlank()) {
-                    webView.loadUrl(url)
-                }
-            },
-            modifier = Modifier.fillMaxSize()
+    private val userAgent =
+        "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+
+    fun resolve(rawInput: String): ResolvedLinkInfo {
+        val cleanUrl = rawInput.trim()
+        val lower = cleanUrl.lowercase()
+
+        if (lower.contains("drive.google.com")) {
+            return resolveGoogleDrive(cleanUrl)
+        }
+
+        // محاولة الاستخراج العميق عبر YoutubeDL (أسلوب الأدوات المتقدمة)
+        tryResolveWithYoutubeDL(cleanUrl)?.let { return it }
+
+        if (lower.contains("dailymotion.com") || lower.contains("dai.ly")) {
+            return resolveDailymotion(cleanUrl)
+        }
+
+        val probe = probeUrl(cleanUrl)
+        val sourceName = detectSourceLabel(lower)
+        val generatedName = probe.fileName ?: buildFallbackName(lower, sourceName, probe.isHtml)
+
+        val formats = when {
+            generatedName.endsWith(".mp3") || generatedName.endsWith(".m4a") || generatedName.endsWith(".wav") ->
+                listOf("MP3 (صوت)", "الملف الأصلي")
+            generatedName.endsWith(".mp4") || generatedName.endsWith(".mkv") || generatedName.endsWith(".webm") ->
+                listOf("MP4 (أفضل جودة)", "720p", "480p", "MP3 (صوت)")
+            generatedName.endsWith(".m3u8") ->
+                listOf("MP4 (أفضل جودة)", "قائمة بث (.m3u8)")
+            else ->
+                listOf("MP4 (أفضل جودة)", "720p", "MP3 (صوت)")
+        }
+
+        val htmlNote = if (probe.isHtml) {
+            "هذا الرابط صفحة ويب وليس ملفاً مباشراً؛ يمكنك فتحه في المتصفح الداخلي وتشغيل الفيديو لالتقاط الوسائط."
+        } else {
+            null
+        }
+
+        return ResolvedLinkInfo(
+            originalUrl = cleanUrl,
+            directDownloadUrl = probe.finalUrl ?: cleanUrl,
+            fileName = generatedName,
+            sourceLabel = sourceName,
+            fileSizeBytes = probe.contentLength,
+            supportsRange = probe.acceptRanges,
+            suggestedFormats = formats,
+            note = htmlNote,
+            isHtmlPage = probe.isHtml
         )
     }
-}
 
-private fun enqueueDirectDownload(
-    context: Context,
-    url: String,
-    fileName: String,
-    format: String
-) {
-    val cleanUrl = url.trim()
-    if (!cleanUrl.startsWith("http://") && !cleanUrl.startsWith("https://")) return
+    private fun tryResolveWithYoutubeDL(url: String): ResolvedLinkInfo? {
+        return try {
+            val request = YoutubeDLRequest(url).apply {
+                addOption("--no-playlist")
+                addOption("--no-warnings")
+            }
+            val videoInfo = YoutubeDL.getInstance().getInfo(request)
+            val title = sanitizeFileName(videoInfo.title?.ifBlank { null } ?: "bahmad_video")
 
-    val safeName = ensureMediaFileName(fileName, cleanUrl, format)
+            val bestFormat = videoInfo.formats
+                ?.filter { !it.url.isNullOrBlank() && it.vcodec != "none" }
+                ?.maxByOrNull { (it.height ?: 0) * 10_000 + (it.tbr?.toInt() ?: 0) }
+                ?: videoInfo.formats?.firstOrNull { !it.url.isNullOrBlank() }
 
-    try {
-        val downloadManager = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-        val request = DownloadManager.Request(Uri.parse(cleanUrl))
-            .setTitle(safeName)
-            .setDescription("بحمد للتحميل — $format")
-            .addRequestHeader(
-                "User-Agent",
-                "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+            val streamUrl = bestFormat?.url ?: videoInfo.url
+            if (streamUrl.isNullOrBlank()) return null
+
+            val ext = bestFormat?.ext?.takeIf { it.isNotBlank() && it != "none" } ?: "mp4"
+            val size = bestFormat?.fileSize?.takeIf { it > 0 } ?: videoInfo.fileSize.takeIf { it > 0 } ?: -1L
+            val extractorLabel = videoInfo.extractorKey?.replaceFirstChar { it.uppercase() } ?: "YoutubeDL"
+
+            val availableFormats = buildList {
+                add("MP4 (أفضل جودة)")
+                videoInfo.formats
+                    ?.mapNotNull { it.height }
+                    ?.filter { it > 0 }
+                    ?.distinct()
+                    ?.sortedDescending()
+                    ?.take(3)
+                    ?.forEach { h -> add("${h}p") }
+                add("MP3 (صوت)")
+            }.distinct()
+
+            ResolvedLinkInfo(
+                originalUrl = url,
+                directDownloadUrl = streamUrl,
+                fileName = "$title.$ext",
+                sourceLabel = extractorLabel,
+                fileSizeBytes = size,
+                supportsRange = true,
+                suggestedFormats = availableFormats,
+                note = "تم استخراج معلومات الوسائط والصيغ عبر محرك الاستخراج.",
+                isHtmlPage = false
             )
-            .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-            .setAllowedOverMetered(true)
-            .setAllowedOverRoaming(true)
-            .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, safeName)
-
-        downloadManager.enqueue(request)
-    } catch (_: Exception) {
+        } catch (_: Throwable) {
+            null
+        }
     }
-}
 
-private fun ensureMediaFileName(rawName: String, url: String, format: String): String {
-    val stripped = rawName
-        .replace(Regex("[\\\\/:*?\"<>|]"), "_")
-        .trim()
-        .ifBlank { "bahmad_media_${System.currentTimeMillis()}" }
-
-    val lowerUrl = url.lowercase()
-    val hasKnownExt = Regex("\\.(mp4|mp3|m4a|webm|mkv|m3u8|pdf|zip|apk|jpg|jpeg|png)$", RegexOption.IGNORE_CASE)
-        .containsMatchIn(stripped)
-
-    if (hasKnownExt) return stripped
-
-    val ext = when {
-        format.contains("MP3", ignoreCase = true) || lowerUrl.contains(".mp3") -> ".mp3"
-        lowerUrl.contains(".m3u8") -> ".m3u8"
-        lowerUrl.contains(".webm") -> ".webm"
-        lowerUrl.contains(".mkv") -> ".mkv"
-        else -> ".mp4"
+    private fun resolveGoogleDrive(url: String): ResolvedLinkInfo {
+        val fileId = extractGoogleDriveId(url)
+        val directUrl = if (fileId != null) {
+            "https://drive.google.com/uc?export=download&confirm=t&id=$fileId"
+        } else {
+            url
+        }
+        val probe = probeUrl(directUrl)
+        return ResolvedLinkInfo(
+            originalUrl = url,
+            directDownloadUrl = probe.finalUrl ?: directUrl,
+            fileName = probe.fileName ?: "bahmad_gdrive_${System.currentTimeMillis()}",
+            sourceLabel = "Google Drive",
+            fileSizeBytes = probe.contentLength,
+            supportsRange = probe.acceptRanges,
+            suggestedFormats = listOf("الملف الأصلي", "MP4", "MP3"),
+            note = if (probe.isHtml) {
+                "تأكد أن الملف مشارك للعامة (Anyone with the link) ليتمكن التطبيق من تنزيله."
+            } else {
+                null
+            },
+            isHtmlPage = probe.isHtml
+        )
     }
-    return "$stripped$ext"
+
+    private fun resolveDailymotion(url: String): ResolvedLinkInfo {
+        val videoId = Regex("(?:video/|dai\\.ly/)([a-zA-Z0-9]+)")
+            .find(url)?.groupValues?.get(1)
+
+        if (videoId != null) {
+            try {
+                val metaUrl = "https://www.dailymotion.com/player/metadata/video/$videoId"
+                val req = Request.Builder()
+                    .url(metaUrl)
+                    .header("User-Agent", userAgent)
+                    .build()
+
+                client.newCall(req).execute().use { resp ->
+                    if (resp.isSuccessful) {
+                        val bodyStr = resp.body?.string().orEmpty()
+                        val json = JSONObject(bodyStr)
+                        val title = sanitizeFileName(
+                            json.optString("title").ifBlank { "dailymotion_$videoId" }
+                        )
+                        val qualities = json.optJSONObject("qualities")
+                        val streamUrl = extractBestStreamUrl(qualities)
+
+                        if (!streamUrl.isNullOrBlank()) {
+                            val probe = probeUrl(streamUrl)
+                            val isHls = streamUrl.contains(".m3u8", ignoreCase = true)
+                            val ext = if (isHls) ".m3u8" else ".mp4"
+                            return ResolvedLinkInfo(
+                                originalUrl = url,
+                                directDownloadUrl = streamUrl,
+                                fileName = "$title$ext",
+                                sourceLabel = "Dailymotion",
+                                fileSizeBytes = probe.contentLength,
+                                supportsRange = probe.acceptRanges,
+                                suggestedFormats = listOf("MP4 (أفضل جودة)", "720p", "MP3 (صوت)"),
+                                note = null,
+                                isHtmlPage = false
+                            )
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+
+        return ResolvedLinkInfo(
+            originalUrl = url,
+            directDownloadUrl = url,
+            fileName = "dailymotion_${videoId ?: System.currentTimeMillis()}.html",
+            sourceLabel = "Dailymotion",
+            fileSizeBytes = -1L,
+            supportsRange = false,
+            suggestedFormats = listOf("MP4", "MP3"),
+            note = "لم يُرجع الرابط ملفاً مباشراً؛ افتحه في المتصفح الداخلي وشغّل الفيديو لالتقاط الوسائط.",
+            isHtmlPage = true
+        )
+    }
+
+    private fun extractBestStreamUrl(qualities: JSONObject?): String? {
+        if (qualities == null) return null
+        val order = listOf("1080", "720", "480", "380", "240", "auto")
+        for (q in order) {
+            val arr: JSONArray = qualities.optJSONArray(q) ?: continue
+            for (i in 0 until arr.length()) {
+                val item = arr.optJSONObject(i) ?: continue
+                val candidate = item.optString("url")
+                if (candidate.startsWith("http")) {
+                    return candidate
+                }
+            }
+        }
+        return null
+    }
+
+    private fun sanitizeFileName(raw: String): String {
+        val cleaned = raw.replace(Regex("[^a-zA-Z0-9._\\-\\u0600-\\u06FF ]"), "_")
+            .trim()
+            .take(60)
+        return cleaned.ifBlank { "bahmad_media" }
+    }
+
+    private fun extractGoogleDriveId(url: String): String? {
+        val dMatch = Regex("/d/([a-zA-Z0-9_-]+)").find(url)
+        if (dMatch != null) return dMatch.groupValues[1]
+        val idMatch = Regex("[?&]id=([a-zA-Z0-9_-]+)").find(url)
+        return idMatch?.groupValues?.get(1)
+    }
+
+    private fun detectSourceLabel(lowerUrl: String): String = when {
+        lowerUrl.contains("dailymotion.com") || lowerUrl.contains("dai.ly") -> "Dailymotion"
+        lowerUrl.contains("drive.google.com") -> "Google Drive"
+        lowerUrl.contains("youtube.com") || lowerUrl.contains("youtu.be") -> "YouTube"
+        lowerUrl.contains("tiktok.com") -> "TikTok"
+        lowerUrl.contains("instagram.com") -> "Instagram"
+        lowerUrl.contains("x.com") || lowerUrl.contains("twitter.com") -> "X / Twitter"
+        lowerUrl.contains("facebook.com") || lowerUrl.contains("fb.watch") -> "Facebook"
+        else -> "رابط / ملف مباشر"
+    }
+
+    private fun buildFallbackName(lowerUrl: String, source: String, isHtml: Boolean): String {
+        val lastSegment = lowerUrl.substringAfterLast("/").substringBefore("?")
+        if (!isHtml && lastSegment.contains(".") && lastSegment.length in 3..60) {
+            return sanitizeFileName(lastSegment)
+        }
+        val ext = when {
+            lowerUrl.contains(".m3u8") -> ".m3u8"
+            lowerUrl.contains(".mp4") -> ".mp4"
+            lowerUrl.contains(".mp3") -> ".mp3"
+            lowerUrl.contains(".pdf") -> ".pdf"
+            lowerUrl.contains(".zip") -> ".zip"
+            lowerUrl.contains(".apk") -> ".apk"
+            isHtml -> ".html"
+            else -> ".mp4"
+        }
+        return "bahmad_${source.replace(" ", "_").lowercase()}_${System.currentTimeMillis()}$ext"
+    }
+
+    private data class ProbeResult(
+        val finalUrl: String?,
+        val fileName: String?,
+        val contentLength: Long,
+        val acceptRanges: Boolean,
+        val isHtml: Boolean
+    )
+
+    private fun probeUrl(url: String): ProbeResult {
+        try {
+            val headReq = Request.Builder()
+                .url(url)
+                .head()
+                .header("User-Agent", userAgent)
+                .build()
+            client.newCall(headReq).execute().use { resp ->
+                val contentType = resp.header("Content-Type")?.lowercase().orEmpty()
+                val isHtml = contentType.contains("text/html") || contentType.contains("application/xhtml")
+                val disposition = resp.header("Content-Disposition")
+                val headerName = disposition?.let {
+                    Regex("filename=\"?([^\";]+)\"?").find(it)?.groupValues?.get(1)
+                }?.let(::sanitizeFileName)
+                val headLen = resp.header("Content-Length")?.toLongOrNull() ?: -1L
+                val ranges = resp.header("Accept-Ranges")?.equals("bytes", ignoreCase = true) == true
+
+                if (headLen > 0L || isHtml) {
+                    return ProbeResult(
+                        finalUrl = resp.request.url.toString(),
+                        fileName = headerName,
+                        contentLength = headLen,
+                        acceptRanges = ranges,
+                        isHtml = isHtml
+                    )
+                }
+            }
+        } catch (_: Exception) {
+        }
+
+        return try {
+            val request = Request.Builder()
+                .url(url)
+                .header("User-Agent", userAgent)
+                .build()
+
+            client.newCall(request).execute().use { response ->
+                val contentType = response.header("Content-Type")?.lowercase().orEmpty()
+                val isHtml = contentType.contains("text/html") || contentType.contains("application/xhtml")
+                val disposition = response.header("Content-Disposition")
+                val headerName = disposition?.let {
+                    Regex("filename=\"?([^\";]+)\"?").find(it)?.groupValues?.get(1)
+                }?.let(::sanitizeFileName)
+                val length = response.body?.contentLength() ?: -1L
+                val ranges = response.header("Accept-Ranges")?.equals("bytes", ignoreCase = true) == true
+
+                ProbeResult(
+                    finalUrl = response.request.url.toString(),
+                    fileName = headerName,
+                    contentLength = length,
+                    acceptRanges = ranges,
+                    isHtml = isHtml
+                )
+            }
+        } catch (_: Exception) {
+            ProbeResult(url, null, -1L, false, false)
+        }
+    }
 }
