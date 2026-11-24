@@ -63,6 +63,41 @@ object DownloaderEngineInitializer {
     }
 }
 
+object FastDownloadEngine {
+
+    fun download(
+        context: Context,
+        url: String,
+        fileName: String = "bahmad_media_${System.currentTimeMillis()}.mp4",
+        format: String = "MP4 (أفضل جودة)",
+        onProgress: (Int) -> Unit = {}
+    ): DownloadOutcome {
+        onProgress(10)
+        val outcome = BahmadMediaDownloader.downloadAndSaveNow(
+            context = context,
+            url = url,
+            rawFileName = fileName,
+            selectedFormat = format
+        )
+        onProgress(if (outcome.success) 100 else 0)
+        return outcome
+    }
+
+    fun startDownload(
+        context: Context,
+        url: String,
+        fileName: String = "bahmad_media_${System.currentTimeMillis()}.mp4",
+        format: String = "MP4 (أفضل جودة)"
+    ): DownloadOutcome {
+        return BahmadMediaDownloader.downloadAndSaveNow(
+            context = context,
+            url = url,
+            rawFileName = fileName,
+            selectedFormat = format
+        )
+    }
+}
+
 object BahmadMediaDownloader {
 
     private val httpClient = OkHttpClient.Builder()
