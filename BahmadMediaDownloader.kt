@@ -11,13 +11,13 @@ import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.Worker
 import androidx.work.WorkerParameters
-import okhttp3.OkHttpClient
-import okhttp3.Request
+import com.yausername.ffmpeg.FFmpeg
+import com.yausername.youtubedl_android.YoutubeDL
+import com.yausername.youtubedl_android.YoutubeDLRequest
 import java.io.File
 import java.io.FileInputStream
 import java.io.OutputStream
 import java.util.UUID
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 data class DownloadOutcome(
@@ -40,18 +40,17 @@ object DownloaderEngineInitializer {
             if (initialized.get()) return true
             return try {
                 val appContext = context.applicationContext
-                val workDir = File(appContext.cacheDir, "bahmad_engine")
-                val stagingDir = File(appContext.filesDir, "bahmad_staging")
-                workDir.mkdirs()
-                stagingDir.mkdirs()
+                val workDir = File(appContext.cacheDir, "bahmad_engine").apply { mkdirs() }
+                val stagingDir = File(appContext.filesDir, "bahmad_staging").apply { mkdirs() }
 
-                val ready = workDir.exists() && workDir.canWrite() &&
-                    stagingDir.exists() && stagingDir.canWrite()
+                YoutubeDL.getInstance().init(appContext)
+                FFmpeg.getInstance().init(appContext)
 
+                val ready = workDir.exists() && stagingDir.exists()
                 lastStatusMessage = if (ready) {
-                    "تمت تهيئة مسارات ومحرك التحميل بنجاح"
+                    "تمت تهيئة محرك yt-dlp و FFmpeg بنجاح"
                 } else {
-                    "تعذر الوصول إلى مسارات العمل الداخلية"
+                    "تعذر تهيئة مجلدات العمل"
                 }
                 initialized.set(ready)
                 ready
@@ -65,18 +64,6 @@ object DownloaderEngineInitializer {
 
 object BahmadMediaDownloader {
 
-    private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(25, TimeUnit.SECONDS)
-        .readTimeout(90, TimeUnit.SECONDS)
-        .followRedirects(true)
-        .followSslRedirects(true)
-        .build()
-
-    private const val USER_AGENT =
-        "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
-
-    private const val MIN_VALID_MEDIA_BYTES = 1024L
-
     fun enqueueBackgroundDownload(
         context: Context,
         info: ResolvedLinkInfo,
@@ -84,12 +71,10 @@ object BahmadMediaDownloader {
     ): UUID {
         DownloaderEngineInitializer.ensureInitialized(context)
         val workId = UUID.randomUUID()
-        val targetUrl = info.directDownloadUrl.ifBlank { info.originalUrl }
-        val refererUrl = info.originalUrl.takeIf { it.startsWith("http") && it != targetUrl }.orEmpty()
+        val targetUrl = info.originalUrl.ifBlank { info.directDownloadUrl }
 
         val inputData = Data.Builder()
             .putString(BahmadDownloadWorker.KEY_URL, targetUrl)
-            .putString(BahmadDownloadWorker.KEY_REFERER, refererUrl)
             .putString(BahmadDownloadWorker.KEY_FILE_NAME, info.fileName)
             .putString(BahmadDownloadWorker.KEY_FORMAT, selectedFormat)
             .build()
@@ -109,90 +94,58 @@ object BahmadMediaDownloader {
         context: Context,
         url: String,
         rawFileName: String,
-        selectedFormat: String,
-        refererUrl: String = ""
+        selectedFormat: String
     ): DownloadOutcome {
-        DownloaderEngineInitializer.ensureInitialized(context)
-
         val cleanUrl = url.trim()
         if (!cleanUrl.startsWith("http://") && !cleanUrl.startsWith("https://")) {
-            return DownloadOutcome(false, "الرابط غير صالح للتحميل المباشر.")
+            return DownloadOutcome(false, "الرابط غير صالح للتحميل.")
+        }
+
+        if (!DownloaderEngineInitializer.ensureInitialized(context)) {
+            return DownloadOutcome(false, DownloaderEngineInitializer.lastStatusMessage)
         }
 
         val isAudioOnly = selectedFormat.contains("MP3", ignoreCase = true) ||
             selectedFormat.contains("صوت", ignoreCase = true)
 
         val baseTitle = sanitizeBaseName(rawFileName)
-        val ext = if (isAudioOnly) "mp3" else resolveExtension(rawFileName, cleanUrl)
-        val tempDir = File(context.cacheDir, "bahmad_downloads").apply { mkdirs() }
-        val tempFile = File(tempDir, "${baseTitle}_${System.currentTimeMillis()}.$ext")
+        val stagingDir = File(context.cacheDir, "bahmad_ytdl_out_${UUID.randomUUID()}").apply { mkdirs() }
 
         return try {
-            val reqBuilder = Request.Builder()
-                .url(cleanUrl)
-                .header("User-Agent", USER_AGENT)
-                .header("Accept", "*/*")
-
-            if (refererUrl.startsWith("http://") || refererUrl.startsWith("https://")) {
-                reqBuilder.header("Referer", refererUrl)
-            }
-
-            httpClient.newCall(reqBuilder.build()).execute().use { resp ->
-                if (!resp.isSuccessful) {
-                    return DownloadOutcome(false, "فشل التنزيل (رمز الاستجابة: ${resp.code}).")
-                }
-                val body = resp.body ?: return DownloadOutcome(false, "تعذر قراءة بيانات الملف.")
-                val contentType = resp.header("Content-Type")?.lowercase().orEmpty()
-
-                val isPlaylist = cleanUrl.contains(".m3u8", ignoreCase = true) ||
-                    contentType.contains("mpegurl")
-
-                if (isPlaylist) {
-                    val playlistBody = body.string()
-                    val downloadedSegments = downloadHlsSegments(
-                        playlistUrl = cleanUrl,
-                        playlistContent = playlistBody,
-                        outputFile = tempFile,
-                        refererUrl = refererUrl,
-                        depth = 0
-                    )
-                    if (!downloadedSegments) {
-                        tempFile.delete()
-                        return DownloadOutcome(
-                            false,
-                            "تعذر تحميل مقاطع البث المباشر (قد يكون البث مشفراً أو يتطلب دمج مسارات منفصلة)."
-                        )
-                    }
+            val request = YoutubeDLRequest(cleanUrl).apply {
+                addOption("--no-playlist")
+                addOption("--no-warnings")
+                if (isAudioOnly) {
+                    addOption("-x")
+                    addOption("--audio-format", "mp3")
+                    addOption("-o", "${stagingDir.absolutePath}/$baseTitle.%(ext)s")
                 } else {
-                    if (contentType.contains("text/html")) {
-                        tempFile.delete()
-                        return DownloadOutcome(
-                            false,
-                            "الخادم أرجع صفحة ويب (HTML) وليس ملف وسائط؛ افتح الرابط في المتصفح الداخلي."
-                        )
-                    }
-
-                    body.byteStream().use { input ->
-                        tempFile.outputStream().use { output ->
-                            input.copyTo(output, bufferSize = 32 * 1024)
-                        }
-                    }
+                    addOption("-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best")
+                    addOption("--merge-output-format", "mp4")
+                    addOption("-o", "${stagingDir.absolutePath}/$baseTitle.%(ext)s")
                 }
             }
 
-            val validationError = validateDownloadedMedia(tempFile, ext)
-            if (validationError != null) {
-                tempFile.delete()
-                return DownloadOutcome(false, validationError)
+            YoutubeDL.getInstance().execute(request, "bahmad_${System.currentTimeMillis()}", null)
+
+            val outputFile = stagingDir.listFiles()
+                ?.filter { it.isFile && it.length() > 1024L && !it.name.endsWith(".part") && !it.name.endsWith(".ytdl") }
+                ?.maxByOrNull { it.lastModified() }
+
+            if (outputFile == null) {
+                deleteRecursively(stagingDir)
+                return DownloadOutcome(false, "لم يتم إنتاج ملف وسائط مكتمل؛ تأكد من صلاحية الرابط.")
             }
 
+            val finalExt = outputFile.extension.ifBlank { if (isAudioOnly) "mp3" else "mp4" }
+            val finalFileName = "$baseTitle.$finalExt"
             val savedPath = saveFileToPublicDownloads(
                 context = context,
-                sourceFile = tempFile,
-                fileName = "$baseTitle.$ext",
-                mimeType = guessMimeType(ext)
+                sourceFile = outputFile,
+                fileName = finalFileName,
+                mimeType = guessMimeType(finalExt)
             )
-            tempFile.delete()
+            deleteRecursively(stagingDir)
 
             if (savedPath != null) {
                 DownloadOutcome(true, "تم حفظ الملف في مجلد التنزيلات: $savedPath", savedPath)
@@ -200,137 +153,16 @@ object BahmadMediaDownloader {
                 DownloadOutcome(false, "تعذر حفظ الملف النهائي في مجلد التنزيلات.")
             }
         } catch (e: Exception) {
-            tempFile.delete()
+            deleteRecursively(stagingDir)
             DownloadOutcome(false, "حدث خطأ أثناء التنزيل: ${e.message ?: "خطأ غير معروف"}")
         }
     }
 
-    private fun validateDownloadedMedia(file: File, ext: String): String? {
-        if (!file.exists() || file.length() < MIN_VALID_MEDIA_BYTES) {
-            return "الملف المحمّل فارغ أو صغير جداً وغير مكتمل."
+    private fun deleteRecursively(dir: File) {
+        if (dir.isDirectory) {
+            dir.listFiles()?.forEach { deleteRecursively(it) }
         }
-
-        val header = ByteArray(16)
-        val readCount = FileInputStream(file).use { it.read(header) }
-        if (readCount <= 0) {
-            return "تعذر قراءة محتوى الملف المحمّل."
-        }
-
-        val asciiHeader = String(header, 0, readCount, Charsets.ISO_8859_1)
-        if (asciiHeader.trimStart().startsWith("<!DOCTYPE", ignoreCase = true) ||
-            asciiHeader.trimStart().startsWith("<html", ignoreCase = true) ||
-            asciiHeader.contains("#EXTM3U")
-        ) {
-            return "المحتوى المحمّل ليس ملف وسائط نهائياً (قد يكون صفحة ويب أو قائمة بث)."
-        }
-
-        return when (ext.lowercase()) {
-            "mp4", "m4a", "m4v" -> {
-                val hasBoxSignature = asciiHeader.contains("ftyp") ||
-                    asciiHeader.contains("moov") ||
-                    asciiHeader.contains("mdat") ||
-                    header.firstOrNull()?.toInt() == 0x47 // MPEG-TS packet sync byte
-                if (!hasBoxSignature) {
-                    "بنية ملف الفيديو غير مكتملة أو تالفة ولا يمكن تشغيلها."
-                } else {
-                    null
-                }
-            }
-            "webm" -> {
-                val isEbml = readCount >= 4 &&
-                    header[0] == 0x1A.toByte() &&
-                    header[1] == 0x45.toByte() &&
-                    header[2] == 0xDF.toByte() &&
-                    header[3] == 0xA3.toByte()
-                if (!isEbml) "بنية ملف WebM غير مكتملة أو تالفة." else null
-            }
-            "mp3" -> {
-                val isId3 = asciiHeader.startsWith("ID3")
-                val isMpegFrame = readCount >= 2 &&
-                    header[0] == 0xFF.toByte() &&
-                    ((header[1].toInt() and 0xE0) == 0xE0)
-                if (!isId3 && !isMpegFrame) "ملف الصوت MP3 غير مكتمل أو غير صالح." else null
-            }
-            else -> null
-        }
-    }
-
-    private fun downloadHlsSegments(
-        playlistUrl: String,
-        playlistContent: String,
-        outputFile: File,
-        refererUrl: String,
-        depth: Int
-    ): Boolean {
-        if (depth > 3 || playlistContent.isBlank()) return false
-
-        val lines = playlistContent.lines().map { it.trim() }.filter { it.isNotEmpty() }
-        val hasNestedVariant = lines.any { it.startsWith("#EXT-X-STREAM-INF", ignoreCase = true) }
-
-        if (hasNestedVariant) {
-            val bestChild = LinkResolver.resolve(playlistUrl).directDownloadUrl
-            if (bestChild.isNotBlank() && bestChild != playlistUrl) {
-                val childReqBuilder = Request.Builder()
-                    .url(bestChild)
-                    .header("User-Agent", USER_AGENT)
-                if (refererUrl.isNotBlank()) childReqBuilder.header("Referer", refererUrl)
-
-                httpClient.newCall(childReqBuilder.build()).execute().use { childResp ->
-                    if (!childResp.isSuccessful) return false
-                    val childText = childResp.body?.string().orEmpty()
-                    return downloadHlsSegments(bestChild, childText, outputFile, refererUrl, depth + 1)
-                }
-            }
-        }
-
-        val segmentUrls = lines
-            .filter { !it.startsWith("#") }
-            .map { resolveUri(playlistUrl, it) }
-
-        if (segmentUrls.isEmpty()) return false
-
-        var writtenBytes = 0L
-        var successfulSegments = 0
-        outputFile.outputStream().use { out ->
-            for (segUrl in segmentUrls) {
-                val segReqBuilder = Request.Builder()
-                    .url(segUrl)
-                    .header("User-Agent", USER_AGENT)
-                if (refererUrl.isNotBlank()) segReqBuilder.header("Referer", refererUrl)
-
-                try {
-                    httpClient.newCall(segReqBuilder.build()).execute().use { segResp ->
-                        if (segResp.isSuccessful) {
-                            val segBody = segResp.body
-                            if (segBody != null) {
-                                val bytes = segBody.byteStream().use { input ->
-                                    input.copyTo(out, bufferSize = 32 * 1024)
-                                }
-                                if (bytes > 0L) {
-                                    writtenBytes += bytes
-                                    successfulSegments++
-                                }
-                            }
-                        }
-                    }
-                } catch (_: Exception) {
-                    // تجاهل مقطع مفرد متعثر إذا أمكن إكمال الباقي
-                }
-            }
-        }
-        return successfulSegments > 0 && writtenBytes >= MIN_VALID_MEDIA_BYTES &&
-            outputFile.exists() && outputFile.length() >= MIN_VALID_MEDIA_BYTES
-    }
-
-    private fun resolveUri(baseUrl: String, candidate: String): String {
-        if (candidate.startsWith("http://") || candidate.startsWith("https://")) {
-            return candidate
-        }
-        return try {
-            java.net.URI(baseUrl).resolve(candidate).toString()
-        } catch (_: Exception) {
-            candidate
-        }
+        dir.delete()
     }
 
     private fun saveFileToPublicDownloads(
@@ -385,29 +217,12 @@ object BahmadMediaDownloader {
         return cleaned.ifBlank { "bahmad_media_${System.currentTimeMillis()}" }
     }
 
-    private fun resolveExtension(fileName: String, url: String): String {
-        val fromName = fileName.substringAfterLast(".", "").lowercase()
-        if (fromName in listOf("mp4", "mp3", "m4a", "webm", "mkv", "pdf", "zip", "apk")) {
-            return fromName
-        }
-        val lowerUrl = url.lowercase()
-        return when {
-            lowerUrl.contains(".mp3") -> "mp3"
-            lowerUrl.contains(".m4a") -> "m4a"
-            lowerUrl.contains(".webm") -> "webm"
-            lowerUrl.contains(".mkv") -> "mkv"
-            else -> "mp4"
-        }
-    }
-
     private fun guessMimeType(ext: String): String = when (ext.lowercase()) {
         "mp4", "m4v" -> "video/mp4"
         "webm" -> "video/webm"
         "mkv" -> "video/x-matroska"
         "mp3" -> "audio/mpeg"
         "m4a" -> "audio/mp4"
-        "pdf" -> "application/pdf"
-        "zip" -> "application/zip"
         else -> "application/octet-stream"
     }
 }
@@ -419,7 +234,6 @@ class BahmadDownloadWorker(
 
     companion object {
         const val KEY_URL = "url"
-        const val KEY_REFERER = "referer"
         const val KEY_FILE_NAME = "file_name"
         const val KEY_FORMAT = "format"
         const val KEY_RESULT_MESSAGE = "result_message"
@@ -427,7 +241,6 @@ class BahmadDownloadWorker(
 
     override fun doWork(): Result {
         val url = inputData.getString(KEY_URL).orEmpty()
-        val referer = inputData.getString(KEY_REFERER).orEmpty()
         val fileName = inputData.getString(KEY_FILE_NAME).orEmpty().ifBlank {
             "bahmad_media_${System.currentTimeMillis()}.mp4"
         }
@@ -437,8 +250,7 @@ class BahmadDownloadWorker(
             context = applicationContext,
             url = url,
             rawFileName = fileName,
-            selectedFormat = format,
-            refererUrl = referer
+            selectedFormat = format
         )
 
         val output = Data.Builder()
