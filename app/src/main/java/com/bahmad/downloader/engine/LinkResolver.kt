@@ -1,11 +1,12 @@
 package com.bahmad.downloader.engine
 
+import com.yausername.youtubedl_android.YoutubeDL
+import com.yausername.youtubedl_android.YoutubeDLRequest
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.TimeUnit
-import java.util.regex.Pattern
 
 data class ResolvedLinkInfo(
     val originalUrl: String,
@@ -45,12 +46,42 @@ object LinkResolver {
             )
         }
 
-        val normalizedUrl = normalizeKnownHosts(trimmed)
-        val sourceLabel = detectSourceLabel(normalizedUrl)
+        val sourceLabel = detectSourceLabel(trimmed)
 
+        // 1) محاولة الاستخراج عبر محرك yt-dlp (مثل بحمد 1)
+        val ytdlpResult = runCatching {
+            val request = YoutubeDLRequest(trimmed).apply {
+                addOption("--no-playlist")
+                addOption("--no-warnings")
+            }
+            val videoInfo = YoutubeDL.getInstance().getInfo(request)
+            val title = sanitizeFileName(videoInfo.title.orEmpty().ifBlank { "bahmad_video_${System.currentTimeMillis()}" })
+            val ext = videoInfo.ext?.takeIf { it.isNotBlank() } ?: "mp4"
+            val streamUrl = videoInfo.url?.takeIf { it.isNotBlank() } ?: trimmed
+            val extractorLabel = videoInfo.extractor?.takeIf { it.isNotBlank() } ?: sourceLabel
+
+            ResolvedLinkInfo(
+                originalUrl = trimmed,
+                directDownloadUrl = streamUrl,
+                fileName = "$title.$ext",
+                mimeType = if (ext == "mp3" || ext == "m4a") "audio/*" else "video/*",
+                fileSizeBytes = videoInfo.fileSize.takeIf { it > 0L },
+                isStreamPlaylist = streamUrl.contains(".m3u8", ignoreCase = true),
+                isHtmlPage = false,
+                sourceLabel = extractorLabel,
+                note = "تم استخراج الوسائط عبر محرك yt-dlp بنجاح.",
+                suggestedFormats = listOf("MP4 (أفضل جودة)", "MP3 (صوت فقط)", "الأصلية")
+            )
+        }.getOrNull()
+
+        if (ytdlpResult != null) {
+            return ytdlpResult
+        }
+
+        // 2) فحص احتياطي عبر OkHttp للروابط المباشرة
         return try {
             val probeRequest = Request.Builder()
-                .url(normalizedUrl)
+                .url(trimmed)
                 .header("User-Agent", DEFAULT_USER_AGENT)
                 .header("Accept", "*/*")
                 .build()
@@ -60,45 +91,13 @@ object LinkResolver {
                 val contentType = response.header("Content-Type")?.substringBefore(";")?.trim()?.lowercase()
                 val contentDisposition = response.header("Content-Disposition")
                 val contentLength = response.header("Content-Length")?.toLongOrNull()?.takeIf { it > 0L }
-
-                val isM3u8 = finalUrl.contains(".m3u8", ignoreCase = true) ||
-                    contentType?.contains("mpegurl") == true
-
-                if (isM3u8) {
-                    val playlistText = response.body?.string().orEmpty()
-                    val bestVariantUrl = extractBestHlsVariantUrl(finalUrl, playlistText)
-                    val title = extractFileName(
-                        url = bestVariantUrl ?: finalUrl,
-                        disposition = contentDisposition,
-                        fallbackPrefix = "bahmad_stream"
-                    ).let { name ->
-                        val base = name.substringBeforeLast(".")
-                        "$base.mp4"
-                    }
-
-                    return ResolvedLinkInfo(
-                        originalUrl = trimmed,
-                        directDownloadUrl = bestVariantUrl ?: finalUrl,
-                        fileName = title,
-                        mimeType = "video/mp4",
-                        fileSizeBytes = null,
-                        isStreamPlaylist = true,
-                        isHtmlPage = false,
-                        sourceLabel = if (sourceLabel == "رابط مباشر") "بث مباشر HLS (.m3u8)" else sourceLabel,
-                        note = "تم استخراج قائمة البث وجاهز للتحميل",
-                        suggestedFormats = listOf("MP4 (أفضل جودة)", "MP3 (صوت فقط)")
-                    )
-                }
-
-                val isHtml = contentType?.contains("text/html") == true &&
-                    !finalUrl.contains("drive.google.com/uc", ignoreCase = true)
+                val isHtml = contentType?.contains("text/html") == true
 
                 val resolvedName = extractFileName(
                     url = finalUrl,
                     disposition = contentDisposition,
                     fallbackPrefix = "bahmad_media"
                 )
-                val formats = buildAvailableFormats(resolvedName, contentType)
 
                 ResolvedLinkInfo(
                     originalUrl = trimmed,
@@ -106,28 +105,26 @@ object LinkResolver {
                     fileName = resolvedName,
                     mimeType = contentType,
                     fileSizeBytes = contentLength,
-                    isStreamPlaylist = false,
+                    isStreamPlaylist = finalUrl.contains(".m3u8", ignoreCase = true),
                     isHtmlPage = isHtml,
                     sourceLabel = sourceLabel,
                     note = if (isHtml) {
-                        "الرابط صفحة ويب؛ يُفضل فتحه في المتصفح الداخلي لالتقاط الوسائط."
+                        "تعذر الاستخراج المباشر للصفحة؛ يمكنك فتحها في المتصفح الداخلي."
                     } else {
                         "تم فحص الرابط بنجاح وجاهز للتحميل."
                     },
-                    suggestedFormats = formats
+                    suggestedFormats = listOf("MP4 (أفضل جودة)", "MP3 (صوت فقط)", "الأصلية")
                 )
             }
         } catch (_: Exception) {
-            val fallbackName = extractFileName(normalizedUrl, null, "bahmad_media")
+            val fallbackName = extractFileName(trimmed, null, "bahmad_media")
             ResolvedLinkInfo(
                 originalUrl = trimmed,
-                directDownloadUrl = normalizedUrl,
+                directDownloadUrl = trimmed,
                 fileName = fallbackName,
-                isStreamPlaylist = normalizedUrl.contains(".m3u8", ignoreCase = true),
-                isHtmlPage = false,
                 sourceLabel = sourceLabel,
-                note = "تعذر الفحص المسبق الكامل؛ يمكنك محاولة التحميل مباشرة.",
-                suggestedFormats = buildAvailableFormats(fallbackName, null)
+                note = "سيتم تمرير الرابط مباشرة إلى محرك التحميل.",
+                suggestedFormats = listOf("MP4 (أفضل جودة)", "MP3 (صوت فقط)")
             )
         }
     }
@@ -135,62 +132,10 @@ object LinkResolver {
     private fun detectSourceLabel(url: String): String {
         val lower = url.lowercase()
         return when {
-            lower.contains("drive.google.com") -> "Google Drive"
             lower.contains("dailymotion.com") || lower.contains("dai.ly") -> "Dailymotion"
+            lower.contains("drive.google.com") -> "Google Drive"
             lower.contains(".m3u8") -> "بث مباشر HLS"
             else -> "رابط مباشر"
-        }
-    }
-
-    private fun normalizeKnownHosts(url: String): String {
-        val driveFileRegex = Pattern.compile("https?://drive\\.google\\.com/file/d/([a-zA-Z0-9_-]+)")
-        val driveMatcher = driveFileRegex.matcher(url)
-        if (driveMatcher.find()) {
-            val fileId = driveMatcher.group(1)
-            return "https://drive.google.com/uc?export=download&id=$fileId"
-        }
-
-        if (url.contains("dai.ly/", ignoreCase = true)) {
-            val videoId = url.substringAfter("dai.ly/").substringBefore("?").substringBefore("/").trim()
-            if (videoId.isNotEmpty()) {
-                return "https://www.dailymotion.com/video/$videoId"
-            }
-        }
-
-        return url
-    }
-
-    private fun extractBestHlsVariantUrl(basePlaylistUrl: String, playlistBody: String): String? {
-        if (playlistBody.isBlank()) return null
-        val lines = playlistBody.lines().map { it.trim() }.filter { it.isNotEmpty() }
-        var highestBandwidth = -1
-        var bestUri: String? = null
-
-        for (i in lines.indices) {
-            val line = lines[i]
-            if (line.startsWith("#EXT-X-STREAM-INF", ignoreCase = true)) {
-                val bwMatch = Regex("""BANDWIDTH=(\d+)""").find(line)
-                val bandwidth = bwMatch?.groupValues?.get(1)?.toIntOrNull() ?: 0
-                val nextLine = lines.getOrNull(i + 1)
-                if (nextLine != null && !nextLine.startsWith("#") && bandwidth > highestBandwidth) {
-                    highestBandwidth = bandwidth
-                    bestUri = nextLine
-                }
-            }
-        }
-
-        val chosen = bestUri ?: lines.firstOrNull { !it.startsWith("#") } ?: return null
-        return resolveRelativeUrl(basePlaylistUrl, chosen)
-    }
-
-    private fun resolveRelativeUrl(baseUrl: String, candidate: String): String {
-        if (candidate.startsWith("http://") || candidate.startsWith("https://")) {
-            return candidate
-        }
-        return try {
-            java.net.URI(baseUrl).resolve(candidate).toString()
-        } catch (_: Exception) {
-            candidate
         }
     }
 
@@ -226,17 +171,5 @@ object LinkResolver {
 
     private fun sanitizeFileName(raw: String): String {
         return raw.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim().take(70)
-    }
-
-    private fun buildAvailableFormats(fileName: String, mimeType: String?): List<String> {
-        val ext = fileName.substringAfterLast(".", "").lowercase()
-        val isAudio = ext in listOf("mp3", "m4a", "aac", "ogg", "wav", "flac") ||
-            mimeType?.startsWith("audio/") == true
-
-        return if (isAudio) {
-            listOf("MP3 (صوت فقط)", "الأصلية")
-        } else {
-            listOf("MP4 (أفضل جودة)", "MP3 (صوت فقط)", "الأصلية")
-        }
     }
 }
