@@ -14,7 +14,10 @@ data class ResolvedLinkInfo(
     val mimeType: String? = null,
     val fileSizeBytes: Long? = null,
     val isStreamPlaylist: Boolean = false,
-    val availableFormats: List<String> = listOf("MP4 (أفضل جودة)", "MP3 (صوت فقط)")
+    val isHtmlPage: Boolean = false,
+    val sourceLabel: String = "رابط مباشر",
+    val note: String? = null,
+    val suggestedFormats: List<String> = listOf("MP4 (أفضل جودة)", "MP3 (صوت فقط)")
 )
 
 object LinkResolver {
@@ -36,11 +39,14 @@ object LinkResolver {
                 originalUrl = trimmed,
                 directDownloadUrl = trimmed,
                 fileName = "bahmad_media_${System.currentTimeMillis()}.mp4",
-                availableFormats = listOf("MP4 (أفضل جودة)")
+                sourceLabel = "رابط غير مباشر",
+                note = "تأكد من بدء الرابط بـ http:// أو https://",
+                suggestedFormats = listOf("MP4 (أفضل جودة)")
             )
         }
 
         val normalizedUrl = normalizeKnownHosts(trimmed)
+        val sourceLabel = detectSourceLabel(normalizedUrl)
 
         return try {
             val probeRequest = Request.Builder()
@@ -77,9 +83,15 @@ object LinkResolver {
                         mimeType = "video/mp4",
                         fileSizeBytes = null,
                         isStreamPlaylist = true,
-                        availableFormats = listOf("MP4 (أفضل جودة)", "MP3 (صوت فقط)")
+                        isHtmlPage = false,
+                        sourceLabel = if (sourceLabel == "رابط مباشر") "بث مباشر HLS (.m3u8)" else sourceLabel,
+                        note = "تم استخراج قائمة البث وجاهز للتحميل",
+                        suggestedFormats = listOf("MP4 (أفضل جودة)", "MP3 (صوت فقط)")
                     )
                 }
+
+                val isHtml = contentType?.contains("text/html") == true &&
+                    !finalUrl.contains("drive.google.com/uc", ignoreCase = true)
 
                 val resolvedName = extractFileName(
                     url = finalUrl,
@@ -95,7 +107,14 @@ object LinkResolver {
                     mimeType = contentType,
                     fileSizeBytes = contentLength,
                     isStreamPlaylist = false,
-                    availableFormats = formats
+                    isHtmlPage = isHtml,
+                    sourceLabel = sourceLabel,
+                    note = if (isHtml) {
+                        "الرابط صفحة ويب؛ يُفضل فتحه في المتصفح الداخلي لالتقاط الوسائط."
+                    } else {
+                        "تم فحص الرابط بنجاح وجاهز للتحميل."
+                    },
+                    suggestedFormats = formats
                 )
             }
         } catch (_: Exception) {
@@ -105,13 +124,25 @@ object LinkResolver {
                 directDownloadUrl = normalizedUrl,
                 fileName = fallbackName,
                 isStreamPlaylist = normalizedUrl.contains(".m3u8", ignoreCase = true),
-                availableFormats = buildAvailableFormats(fallbackName, null)
+                isHtmlPage = false,
+                sourceLabel = sourceLabel,
+                note = "تعذر الفحص المسبق الكامل؛ يمكنك محاولة التحميل مباشرة.",
+                suggestedFormats = buildAvailableFormats(fallbackName, null)
             )
         }
     }
 
+    private fun detectSourceLabel(url: String): String {
+        val lower = url.lowercase()
+        return when {
+            lower.contains("drive.google.com") -> "Google Drive"
+            lower.contains("dailymotion.com") || lower.contains("dai.ly") -> "Dailymotion"
+            lower.contains(".m3u8") -> "بث مباشر HLS"
+            else -> "رابط مباشر"
+        }
+    }
+
     private fun normalizeKnownHosts(url: String): String {
-        // معالجة روابط Google Drive الشائعة
         val driveFileRegex = Pattern.compile("https?://drive\\.google\\.com/file/d/([a-zA-Z0-9_-]+)")
         val driveMatcher = driveFileRegex.matcher(url)
         if (driveMatcher.find()) {
@@ -119,7 +150,6 @@ object LinkResolver {
             return "https://drive.google.com/uc?export=download&id=$fileId"
         }
 
-        // معالجة روابط Dailymotion القصيرة/العادية
         if (url.contains("dai.ly/", ignoreCase = true)) {
             val videoId = url.substringAfter("dai.ly/").substringBefore("?").substringBefore("/").trim()
             if (videoId.isNotEmpty()) {
