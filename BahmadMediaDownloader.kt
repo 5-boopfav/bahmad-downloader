@@ -9,6 +9,8 @@ import androidx.work.Data
 import androidx.work.ExistingWorkPolicy
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
+import androidx.work.Worker
+import androidx.work.WorkerParameters
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
@@ -16,6 +18,7 @@ import java.io.FileInputStream
 import java.io.OutputStream
 import java.util.UUID
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 data class DownloadOutcome(
     val success: Boolean,
@@ -23,13 +26,54 @@ data class DownloadOutcome(
     val savedLocation: String? = null
 )
 
+object DownloaderEngineInitializer {
+
+    private val initialized = AtomicBoolean(false)
+
+    @Volatile
+    var lastStatusMessage: String = "محرك التحميل جاهز للتهيئة"
+        private set
+
+    fun ensureInitialized(context: Context): Boolean {
+        if (initialized.get()) return true
+        synchronized(this) {
+            if (initialized.get()) return true
+            return try {
+                val appContext = context.applicationContext
+                val workDir = File(appContext.cacheDir, "bahmad_engine")
+                val stagingDir = File(appContext.filesDir, "bahmad_staging")
+                workDir.mkdirs()
+                stagingDir.mkdirs()
+
+                val ready = workDir.exists() && workDir.canWrite() &&
+                    stagingDir.exists() && stagingDir.canWrite()
+
+                lastStatusMessage = if (ready) {
+                    "تمت تهيئة مسارات ومحرك التحميل بنجاح"
+                } else {
+                    "تعذر الوصول إلى مسارات العمل الداخلية"
+                }
+                initialized.set(ready)
+                ready
+            } catch (e: Exception) {
+                lastStatusMessage = "فشل تهيئة المحرك: ${e.message ?: "خطأ غير معروف"}"
+                false
+            }
+        }
+    }
+}
+
 object BahmadMediaDownloader {
 
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(20, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
+        .connectTimeout(25, TimeUnit.SECONDS)
+        .readTimeout(90, TimeUnit.SECONDS)
         .followRedirects(true)
+        .followSslRedirects(true)
         .build()
+
+    private const val USER_AGENT =
+        "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
 
     fun enqueueBackgroundDownload(
         context: Context,
@@ -50,7 +94,7 @@ object BahmadMediaDownloader {
             .build()
 
         WorkManager.getInstance(context.applicationContext)
-            .enqueueUniqueWork("bahmad_dl_${workId}", ExistingWorkPolicy.REPLACE, request)
+            .enqueueUniqueWork("bahmad_dl_$workId", ExistingWorkPolicy.REPLACE, request)
 
         return workId
     }
@@ -79,10 +123,8 @@ object BahmadMediaDownloader {
         return try {
             val req = Request.Builder()
                 .url(cleanUrl)
-                .header(
-                    "User-Agent",
-                    "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
-                )
+                .header("User-Agent", USER_AGENT)
+                .header("Accept", "*/*")
                 .build()
 
             httpClient.newCall(req).execute().use { resp ->
@@ -91,17 +133,30 @@ object BahmadMediaDownloader {
                 }
                 val body = resp.body ?: return DownloadOutcome(false, "تعذر قراءة بيانات الملف.")
                 val contentType = resp.header("Content-Type")?.lowercase().orEmpty()
-                if (contentType.contains("text/html")) {
-                    tempFile.delete()
-                    return DownloadOutcome(
-                        false,
-                        "الخادم أرجع صفحة ويب (HTML) وليس ملف وسائط؛ افتح الرابط في المتصفح الداخلي."
-                    )
-                }
 
-                body.byteStream().use { input ->
-                    tempFile.outputStream().use { output ->
-                        input.copyTo(output, bufferSize = 16 * 1024)
+                val isPlaylist = cleanUrl.contains(".m3u8", ignoreCase = true) ||
+                    contentType.contains("mpegurl")
+
+                if (isPlaylist) {
+                    val playlistBody = body.string()
+                    val downloadedSegments = downloadHlsSegments(cleanUrl, playlistBody, tempFile)
+                    if (!downloadedSegments) {
+                        tempFile.delete()
+                        return DownloadOutcome(false, "تعذر تجميع مقاطع البث المباشر بالكامل.")
+                    }
+                } else {
+                    if (contentType.contains("text/html")) {
+                        tempFile.delete()
+                        return DownloadOutcome(
+                            false,
+                            "الخادم أرجع صفحة ويب (HTML) وليس ملف وسائط؛ افتح الرابط في المتصفح الداخلي."
+                        )
+                    }
+
+                    body.byteStream().use { input ->
+                        tempFile.outputStream().use { output ->
+                            input.copyTo(output, bufferSize = 32 * 1024)
+                        }
                     }
                 }
             }
@@ -130,6 +185,64 @@ object BahmadMediaDownloader {
         }
     }
 
+    private fun downloadHlsSegments(
+        playlistUrl: String,
+        playlistContent: String,
+        outputFile: File
+    ): Boolean {
+        val lines = playlistContent.lines().map { it.trim() }.filter { it.isNotEmpty() }
+        val hasNestedVariant = lines.any { it.startsWith("#EXT-X-STREAM-INF", ignoreCase = true) }
+
+        if (hasNestedVariant) {
+            val bestChild = LinkResolver.resolve(playlistUrl).directDownloadUrl
+            if (bestChild.isNotBlank() && bestChild != playlistUrl) {
+                val childReq = Request.Builder()
+                    .url(bestChild)
+                    .header("User-Agent", USER_AGENT)
+                    .build()
+                httpClient.newCall(childReq).execute().use { childResp ->
+                    if (!childResp.isSuccessful) return false
+                    val childText = childResp.body?.string().orEmpty()
+                    return downloadHlsSegments(bestChild, childText, outputFile)
+                }
+            }
+        }
+
+        val segmentUrls = lines
+            .filter { !it.startsWith("#") }
+            .map { resolveUri(playlistUrl, it) }
+
+        if (segmentUrls.isEmpty()) return false
+
+        outputFile.outputStream().use { out ->
+            for (segUrl in segmentUrls) {
+                val segReq = Request.Builder()
+                    .url(segUrl)
+                    .header("User-Agent", USER_AGENT)
+                    .build()
+                httpClient.newCall(segReq).execute().use { segResp ->
+                    if (!segResp.isSuccessful) return false
+                    val segBody = segResp.body ?: return false
+                    segBody.byteStream().use { input ->
+                        input.copyTo(out, bufferSize = 32 * 1024)
+                    }
+                }
+            }
+        }
+        return outputFile.exists() && outputFile.length() > 0L
+    }
+
+    private fun resolveUri(baseUrl: String, candidate: String): String {
+        if (candidate.startsWith("http://") || candidate.startsWith("https://")) {
+            return candidate
+        }
+        return try {
+            java.net.URI(baseUrl).resolve(candidate).toString()
+        } catch (_: Exception) {
+            candidate
+        }
+    }
+
     private fun saveFileToPublicDownloads(
         context: Context,
         sourceFile: File,
@@ -149,7 +262,7 @@ object BahmadMediaDownloader {
 
                 resolver.openOutputStream(uri)?.use { out: OutputStream ->
                     FileInputStream(sourceFile).use { input ->
-                        input.copyTo(out, bufferSize = 16 * 1024)
+                        input.copyTo(out, bufferSize = 32 * 1024)
                     }
                 }
 
@@ -163,7 +276,7 @@ object BahmadMediaDownloader {
                 val dest = File(downloadsDir, fileName)
                 FileInputStream(sourceFile).use { input ->
                     dest.outputStream().use { output ->
-                        input.copyTo(output, bufferSize = 16 * 1024)
+                        input.copyTo(output, bufferSize = 32 * 1024)
                     }
                 }
                 dest.absolutePath
@@ -206,5 +319,43 @@ object BahmadMediaDownloader {
         "pdf" -> "application/pdf"
         "zip" -> "application/zip"
         else -> "application/octet-stream"
+    }
+}
+
+class BahmadDownloadWorker(
+    appContext: Context,
+    workerParams: WorkerParameters
+) : Worker(appContext, workerParams) {
+
+    companion object {
+        const val KEY_URL = "url"
+        const val KEY_FILE_NAME = "file_name"
+        const val KEY_FORMAT = "format"
+        const val KEY_RESULT_MESSAGE = "result_message"
+    }
+
+    override fun doWork(): Result {
+        val url = inputData.getString(KEY_URL).orEmpty()
+        val fileName = inputData.getString(KEY_FILE_NAME).orEmpty().ifBlank {
+            "bahmad_media_${System.currentTimeMillis()}.mp4"
+        }
+        val format = inputData.getString(KEY_FORMAT).orEmpty().ifBlank { "MP4 (أفضل جودة)" }
+
+        val outcome = BahmadMediaDownloader.downloadAndSaveNow(
+            context = applicationContext,
+            url = url,
+            rawFileName = fileName,
+            selectedFormat = format
+        )
+
+        val output = Data.Builder()
+            .putString(KEY_RESULT_MESSAGE, outcome.message)
+            .build()
+
+        return if (outcome.success) {
+            Result.success(output)
+        } else {
+            Result.failure(output)
+        }
     }
 }
