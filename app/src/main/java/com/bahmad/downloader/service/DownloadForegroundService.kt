@@ -48,7 +48,7 @@ class DownloadForegroundService : Service() {
         val taskId = intent?.getStringExtra(EXTRA_TASK_ID) ?: return START_NOT_STICKY
 
         serviceScope.launch {
-            engine.runDownload(taskId) { title, percent, speedText, completed, failed ->
+            engine.runDownload(applicationContext, taskId) { title, percent, speedText, completed, failed ->
                 val text = when {
                     completed -> "اكتمل التحميل: $title"
                     failed -> "تعذر التحميل: $title"
