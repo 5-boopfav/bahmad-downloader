@@ -102,7 +102,6 @@ class MainActivity : ComponentActivity() {
 private fun BahmadMainScreen() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val resolver = remember { LinkResolver() }
 
     var urlInput by remember { mutableStateOf("") }
     var isChecking by remember { mutableStateOf(false) }
@@ -232,7 +231,7 @@ private fun BahmadMainScreen() {
                                     scope.launch {
                                         val result = withContext(Dispatchers.IO) {
                                             DownloaderEngineInitializer.ensureInitialized(context)
-                                            resolver.resolve(target)
+                                            LinkResolver.resolve(target)
                                         }
                                         isChecking = false
                                         resolvedInfo = result
@@ -325,7 +324,6 @@ private fun BahmadMainScreen() {
                                     fileName = "bahmad_captured_${System.currentTimeMillis()}.mp4",
                                     sourceLabel = "المتصفح الداخلي",
                                     fileSizeBytes = -1L,
-                                    supportsRange = true,
                                     suggestedFormats = listOf("MP4 (أفضل جودة)")
                                 )
                                 startBackgroundDownload(capturedInfo, "MP4 (أفضل جودة)")
