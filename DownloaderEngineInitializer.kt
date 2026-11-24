@@ -1,8 +1,7 @@
 package com.bahmad.downloader.engine
 
 import android.content.Context
-import com.yausername.ffmpeg.FFmpeg
-import com.yausername.youtubedl_android.YoutubeDL
+import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 
 object DownloaderEngineInitializer {
@@ -15,22 +14,27 @@ object DownloaderEngineInitializer {
 
     fun ensureInitialized(context: Context): Boolean {
         if (initialized.get()) return true
-
         synchronized(this) {
             if (initialized.get()) return true
-            val appContext = context.applicationContext
             return try {
-                YoutubeDL.getInstance().init(appContext)
-                try {
-                    FFmpeg.getInstance().init(appContext)
-                    lastStatusMessage = "تمت تهيئة YoutubeDL و FFmpeg بنجاح"
-                } catch (_: Throwable) {
-                    lastStatusMessage = "تمت تهيئة YoutubeDL (FFmpeg غير متاح في هذه النسخة)"
+                val appContext = context.applicationContext
+                val workDir = File(appContext.cacheDir, "bahmad_engine")
+                val outputStagingDir = File(appContext.filesDir, "bahmad_staging")
+                workDir.mkdirs()
+                outputStagingDir.mkdirs()
+
+                val ready = workDir.exists() && workDir.canWrite() &&
+                    outputStagingDir.exists() && outputStagingDir.canWrite()
+
+                lastStatusMessage = if (ready) {
+                    "تمت تهيئة مسارات ومحرك التحميل بنجاح"
+                } else {
+                    "تعذر الوصول إلى مسارات العمل الداخلية"
                 }
-                initialized.set(true)
-                true
-            } catch (t: Throwable) {
-                lastStatusMessage = "تعذرت تهيئة محرك الاستخراج: ${t.message ?: "خطأ غير معروف"}"
+                initialized.set(ready)
+                ready
+            } catch (e: Exception) {
+                lastStatusMessage = "فشل تهيئة المحرك: ${e.message ?: "خطأ غير معروف"}"
                 false
             }
         }
