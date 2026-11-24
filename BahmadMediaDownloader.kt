@@ -75,6 +75,8 @@ object BahmadMediaDownloader {
     private const val USER_AGENT =
         "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
 
+    private const val MIN_VALID_MEDIA_BYTES = 1024L
+
     fun enqueueBackgroundDownload(
         context: Context,
         info: ResolvedLinkInfo,
@@ -158,7 +160,7 @@ object BahmadMediaDownloader {
                         tempFile.delete()
                         return DownloadOutcome(
                             false,
-                            "تعذر تحميل مقاطع البث المباشر (قد يكون البث محمياً أو يتطلب محرك yt-dlp)."
+                            "تعذر تحميل مقاطع البث المباشر (قد يكون البث مشفراً أو يتطلب دمج مسارات منفصلة)."
                         )
                     }
                 } else {
@@ -178,9 +180,10 @@ object BahmadMediaDownloader {
                 }
             }
 
-            if (!tempFile.exists() || tempFile.length() == 0L) {
+            val validationError = validateDownloadedMedia(tempFile, ext)
+            if (validationError != null) {
                 tempFile.delete()
-                return DownloadOutcome(false, "الملف المحمّل فارغ أو غير مكتمل.")
+                return DownloadOutcome(false, validationError)
             }
 
             val savedPath = saveFileToPublicDownloads(
@@ -199,6 +202,56 @@ object BahmadMediaDownloader {
         } catch (e: Exception) {
             tempFile.delete()
             DownloadOutcome(false, "حدث خطأ أثناء التنزيل: ${e.message ?: "خطأ غير معروف"}")
+        }
+    }
+
+    private fun validateDownloadedMedia(file: File, ext: String): String? {
+        if (!file.exists() || file.length() < MIN_VALID_MEDIA_BYTES) {
+            return "الملف المحمّل فارغ أو صغير جداً وغير مكتمل."
+        }
+
+        val header = ByteArray(16)
+        val readCount = FileInputStream(file).use { it.read(header) }
+        if (readCount <= 0) {
+            return "تعذر قراءة محتوى الملف المحمّل."
+        }
+
+        val asciiHeader = String(header, 0, readCount, Charsets.ISO_8859_1)
+        if (asciiHeader.trimStart().startsWith("<!DOCTYPE", ignoreCase = true) ||
+            asciiHeader.trimStart().startsWith("<html", ignoreCase = true) ||
+            asciiHeader.contains("#EXTM3U")
+        ) {
+            return "المحتوى المحمّل ليس ملف وسائط نهائياً (قد يكون صفحة ويب أو قائمة بث)."
+        }
+
+        return when (ext.lowercase()) {
+            "mp4", "m4a", "m4v" -> {
+                val hasBoxSignature = asciiHeader.contains("ftyp") ||
+                    asciiHeader.contains("moov") ||
+                    asciiHeader.contains("mdat") ||
+                    header.firstOrNull()?.toInt() == 0x47 // MPEG-TS packet sync byte
+                if (!hasBoxSignature) {
+                    "بنية ملف الفيديو غير مكتملة أو تالفة ولا يمكن تشغيلها."
+                } else {
+                    null
+                }
+            }
+            "webm" -> {
+                val isEbml = readCount >= 4 &&
+                    header[0] == 0x1A.toByte() &&
+                    header[1] == 0x45.toByte() &&
+                    header[2] == 0xDF.toByte() &&
+                    header[3] == 0xA3.toByte()
+                if (!isEbml) "بنية ملف WebM غير مكتملة أو تالفة." else null
+            }
+            "mp3" -> {
+                val isId3 = asciiHeader.startsWith("ID3")
+                val isMpegFrame = readCount >= 2 &&
+                    header[0] == 0xFF.toByte() &&
+                    ((header[1].toInt() and 0xE0) == 0xE0)
+                if (!isId3 && !isMpegFrame) "ملف الصوت MP3 غير مكتمل أو غير صالح." else null
+            }
+            else -> null
         }
     }
 
@@ -237,6 +290,7 @@ object BahmadMediaDownloader {
         if (segmentUrls.isEmpty()) return false
 
         var writtenBytes = 0L
+        var successfulSegments = 0
         outputFile.outputStream().use { out ->
             for (segUrl in segmentUrls) {
                 val segReqBuilder = Request.Builder()
@@ -252,7 +306,10 @@ object BahmadMediaDownloader {
                                 val bytes = segBody.byteStream().use { input ->
                                     input.copyTo(out, bufferSize = 32 * 1024)
                                 }
-                                writtenBytes += bytes
+                                if (bytes > 0L) {
+                                    writtenBytes += bytes
+                                    successfulSegments++
+                                }
                             }
                         }
                     }
@@ -261,7 +318,8 @@ object BahmadMediaDownloader {
                 }
             }
         }
-        return writtenBytes > 0L && outputFile.exists() && outputFile.length() > 0L
+        return successfulSegments > 0 && writtenBytes >= MIN_VALID_MEDIA_BYTES &&
+            outputFile.exists() && outputFile.length() >= MIN_VALID_MEDIA_BYTES
     }
 
     private fun resolveUri(baseUrl: String, candidate: String): String {
