@@ -18,6 +18,16 @@ object LinkResolver {
     const val BROWSER_USER_AGENT =
         "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
+    fun applyCommonOptions(request: YoutubeDLRequest, targetUrl: String) {
+        val lower = targetUrl.lowercase(Locale.US)
+        request.addOption("--no-update")
+        request.addOption("--no-playlist")
+        request.addOption("--user-agent", BROWSER_USER_AGENT)
+        if ("dailymotion.com" in lower || "dai.ly" in lower) {
+            request.addOption("--referer", "https://www.dailymotion.com/")
+        }
+    }
+
     fun resolve(rawUrl: String): ResolvedLinkInfo {
         val cleaned = rawUrl.trim()
         val normalizedUrl = if (cleaned.startsWith("http://") || cleaned.startsWith("https://")) {
@@ -40,9 +50,8 @@ object LinkResolver {
 
         return try {
             val request = YoutubeDLRequest(normalizedUrl).apply {
-                addOption("--no-playlist")
+                applyCommonOptions(this, normalizedUrl)
                 addOption("--skip-download")
-                addOption("--user-agent", BROWSER_USER_AGENT)
             }
             val info = YoutubeDL.getInstance().getInfo(request)
             val title = sanitizeFileName(info.title ?: "bahmad_video")
