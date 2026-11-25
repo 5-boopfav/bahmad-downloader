@@ -86,7 +86,7 @@ object DownloaderEngineInitializer {
 
 object BahmadMediaDownloader {
 
-    private const val MIN_REAL_MEDIA_BYTES = 262_144L // 256 KB لتجنب حفظ ملفات فارغة أو مقطوعة
+    private const val MIN_REAL_MEDIA_BYTES = 262_144L // 256 KB
 
     fun enqueueBackgroundDownload(
         context: Context,
@@ -123,6 +123,13 @@ object BahmadMediaDownloader {
         val cleanUrl = url.trim()
         if (!cleanUrl.startsWith("http://") && !cleanUrl.startsWith("https://")) {
             return DownloadOutcome(false, "الرابط غير صالح للتحميل.")
+        }
+
+        if (LinkResolver.isLikelyAdUrl(cleanUrl)) {
+            return DownloadOutcome(
+                false,
+                "تم رفض الرابط لأنه يبدو كرابط إعلان وليس الفيديو الأساسي."
+            )
         }
 
         if (!DownloaderEngineInitializer.ensureInitialized(context)) {
@@ -187,9 +194,9 @@ object BahmadMediaDownloader {
                 return DownloadOutcome(
                     false,
                     if (lastErr != null) {
-                        "لم يكتمل تنزيل وسائط صالحة: $lastErr"
+                        "لم يكتمل تنزيل الفيديو الأساسي: $lastErr"
                     } else {
-                        "لم يتم إنتاج ملف وسائط صالح؛ قد يكون الفيديو مقيداً أو يتطلب تحديث yt-dlp."
+                        "لم يتم إنتاج ملف فيديو صالح؛ قد يكون البث مقيداً أو إعلانياً فقط."
                     }
                 )
             }
