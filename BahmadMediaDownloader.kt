@@ -5,6 +5,7 @@ import android.content.Context
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
+import android.webkit.CookieManager
 import androidx.work.Data
 import androidx.work.ExistingWorkPolicy
 import androidx.work.OneTimeWorkRequestBuilder
@@ -29,22 +30,16 @@ data class DownloadOutcome(
 object DownloaderEngineInitializer {
 
     private val initialized = AtomicBoolean(false)
-    private val updateChecked = AtomicBoolean(false)
+    private val updatedOnce = AtomicBoolean(false)
 
     @Volatile
     var lastStatusMessage: String = "محرك التحميل جاهز للتهيئة"
         private set
 
     fun ensureInitialized(context: Context): Boolean {
-        if (initialized.get()) {
-            maybeUpdateEngineAsync(context)
-            return true
-        }
+        if (initialized.get()) return true
         synchronized(this) {
-            if (initialized.get()) {
-                maybeUpdateEngineAsync(context)
-                return true
-            }
+            if (initialized.get()) return true
             return try {
                 val appContext = context.applicationContext
                 val workDir = File(appContext.cacheDir, "bahmad_engine").apply { mkdirs() }
@@ -60,9 +55,6 @@ object DownloaderEngineInitializer {
                     "تعذر تهيئة مجلدات العمل"
                 }
                 initialized.set(ready)
-                if (ready) {
-                    maybeUpdateEngineAsync(appContext)
-                }
                 ready
             } catch (e: Exception) {
                 lastStatusMessage = "فشل تهيئة المحرك: ${e.message ?: "خطأ غير معروف"}"
@@ -71,16 +63,14 @@ object DownloaderEngineInitializer {
         }
     }
 
-    private fun maybeUpdateEngineAsync(context: Context) {
-        if (!updateChecked.compareAndSet(false, true)) return
-        Thread {
-            runCatching {
-                YoutubeDL.getInstance().updateYoutubeDL(
-                    context.applicationContext,
-                    YoutubeDL.UpdateChannel.STABLE
-                )
-            }
-        }.start()
+    fun ensureEngineUpdatedOnce(context: Context) {
+        if (!updatedOnce.compareAndSet(false, true)) return
+        runCatching {
+            YoutubeDL.getInstance().updateYoutubeDL(
+                context.applicationContext,
+                YoutubeDL.UpdateChannel.STABLE
+            )
+        }
     }
 }
 
@@ -96,9 +86,14 @@ object BahmadMediaDownloader {
         DownloaderEngineInitializer.ensureInitialized(context)
         val workId = UUID.randomUUID()
         val targetUrl = info.originalUrl.ifBlank { info.directDownloadUrl }
+        val cookieHeader = runCatching {
+            CookieManager.getInstance().getCookie(targetUrl).orEmpty()
+        }.getOrDefault("")
 
         val inputData = Data.Builder()
             .putString(BahmadDownloadWorker.KEY_URL, targetUrl)
+            .putString(BahmadDownloadWorker.KEY_REFERER, targetUrl)
+            .putString(BahmadDownloadWorker.KEY_COOKIE, cookieHeader)
             .putString(BahmadDownloadWorker.KEY_FILE_NAME, info.fileName)
             .putString(BahmadDownloadWorker.KEY_FORMAT, selectedFormat)
             .build()
@@ -118,17 +113,19 @@ object BahmadMediaDownloader {
         context: Context,
         url: String,
         rawFileName: String,
-        selectedFormat: String
+        selectedFormat: String,
+        refererUrl: String = "",
+        cookieHeader: String = ""
     ): DownloadOutcome {
         val cleanUrl = url.trim()
         if (!cleanUrl.startsWith("http://") && !cleanUrl.startsWith("https://")) {
             return DownloadOutcome(false, "الرابط غير صالح للتحميل.")
         }
 
-        if (LinkResolver.isLikelyAdUrl(cleanUrl)) {
+        if (LinkResolver.isLikelyAdOrSegmentUrl(cleanUrl)) {
             return DownloadOutcome(
                 false,
-                "تم رفض الرابط لأنه يبدو كرابط إعلان وليس الفيديو الأساسي."
+                "تم رفض الرابط لأنه إعلان أو مقطع بث مجزأ وليس رابط الفيديو الأساسي."
             )
         }
 
@@ -136,8 +133,16 @@ object BahmadMediaDownloader {
             return DownloadOutcome(false, DownloaderEngineInitializer.lastStatusMessage)
         }
 
+        DownloaderEngineInitializer.ensureEngineUpdatedOnce(context)
+
         val isAudioOnly = selectedFormat.contains("MP3", ignoreCase = true) ||
             selectedFormat.contains("صوت", ignoreCase = true)
+        val is720p = selectedFormat.contains("720", ignoreCase = true)
+
+        val effectiveReferer = refererUrl.ifBlank { cleanUrl }
+        val effectiveCookie = cookieHeader.ifBlank {
+            runCatching { CookieManager.getInstance().getCookie(cleanUrl).orEmpty() }.getOrDefault("")
+        }
 
         val baseTitle = sanitizeBaseName(rawFileName)
         val stagingDir = File(context.cacheDir, "bahmad_ytdl_out_${UUID.randomUUID()}").apply { mkdirs() }
@@ -149,11 +154,21 @@ object BahmadMediaDownloader {
                 addOption("--no-warnings")
                 addOption("--no-check-certificates")
                 addOption("--geo-bypass")
-                addOption("--retries", "3")
-                addOption("--fragment-retries", "3")
+                addOption("--user-agent", LinkResolver.BROWSER_USER_AGENT)
+                addOption("--referer", effectiveReferer)
+                if (effectiveCookie.isNotBlank()) {
+                    addOption("--add-header", "Cookie:$effectiveCookie")
+                }
+                addOption("--retries", "4")
+                addOption("--fragment-retries", "4")
+
                 if (isAudioOnly) {
                     addOption("-x")
                     addOption("--audio-format", "mp3")
+                    addOption("-o", "${stagingDir.absolutePath}/$baseTitle.%(ext)s")
+                } else if (is720p) {
+                    addOption("-f", "bestvideo[height<=720]+bestaudio/best[height<=720]/best")
+                    addOption("--merge-output-format", "mp4")
                     addOption("-o", "${stagingDir.absolutePath}/$baseTitle.%(ext)s")
                 } else {
                     addOption("-f", "bestvideo+bestaudio/best")
@@ -167,8 +182,8 @@ object BahmadMediaDownloader {
                 "bahmad_${System.currentTimeMillis()}"
             ) { _, _, line ->
                 if (!line.isNullOrBlank()) {
-                    if (logBuilder.length > 2000) {
-                        logBuilder.delete(0, logBuilder.length - 1200)
+                    if (logBuilder.length > 2500) {
+                        logBuilder.delete(0, logBuilder.length - 1500)
                     }
                     logBuilder.append(line).append('\n')
                 }
@@ -183,20 +198,20 @@ object BahmadMediaDownloader {
                         !it.name.endsWith(".temp") &&
                         !it.name.endsWith(".tmp")
                 }
-                ?.maxByOrNull { it.lastModified() }
+                ?.maxByOrNull { it.length() }
 
             if (outputFile == null) {
                 deleteRecursively(stagingDir)
                 val lastErr = logBuilder.toString()
                     .lineSequence()
                     .lastOrNull { it.isNotBlank() }
-                    ?.take(150)
+                    ?.take(180)
                 return DownloadOutcome(
                     false,
                     if (lastErr != null) {
-                        "لم يكتمل تنزيل الفيديو الأساسي: $lastErr"
+                        "فشل الاستخراج: $lastErr"
                     } else {
-                        "لم يتم إنتاج ملف فيديو صالح؛ قد يكون البث مقيداً أو إعلانياً فقط."
+                        "لم يتم العثور على ملف فيديو مكتمل (أقل من 256 KB أو غير متاح)."
                     }
                 )
             }
@@ -212,7 +227,7 @@ object BahmadMediaDownloader {
             deleteRecursively(stagingDir)
 
             if (savedPath != null) {
-                DownloadOutcome(true, "تم حفظ الملف في مجلد التنزيلات: $savedPath", savedPath)
+                DownloadOutcome(true, "تم حفظ الفيديو بنجاح في: $savedPath", savedPath)
             } else {
                 DownloadOutcome(false, "تعذر حفظ الملف النهائي في مجلد التنزيلات.")
             }
@@ -223,7 +238,7 @@ object BahmadMediaDownloader {
                 .lastOrNull { it.isNotBlank() }
                 ?: e.message?.lineSequence()?.lastOrNull { it.isNotBlank() }
                 ?: "خطأ غير معروف"
-            DownloadOutcome(false, "فشل التنزيل: ${detail.take(160)}")
+            DownloadOutcome(false, "فشل التنزيل: ${detail.take(180)}")
         }
     }
 
@@ -303,6 +318,8 @@ class BahmadDownloadWorker(
 
     companion object {
         const val KEY_URL = "url"
+        const val KEY_REFERER = "referer"
+        const val KEY_COOKIE = "cookie"
         const val KEY_FILE_NAME = "file_name"
         const val KEY_FORMAT = "format"
         const val KEY_RESULT_MESSAGE = "result_message"
@@ -310,6 +327,8 @@ class BahmadDownloadWorker(
 
     override fun doWork(): Result {
         val url = inputData.getString(KEY_URL).orEmpty()
+        val referer = inputData.getString(KEY_REFERER).orEmpty()
+        val cookie = inputData.getString(KEY_COOKIE).orEmpty()
         val fileName = inputData.getString(KEY_FILE_NAME).orEmpty().ifBlank {
             "bahmad_media_${System.currentTimeMillis()}.mp4"
         }
@@ -319,7 +338,9 @@ class BahmadDownloadWorker(
             context = applicationContext,
             url = url,
             rawFileName = fileName,
-            selectedFormat = format
+            selectedFormat = format,
+            refererUrl = referer,
+            cookieHeader = cookie
         )
 
         val output = Data.Builder()
