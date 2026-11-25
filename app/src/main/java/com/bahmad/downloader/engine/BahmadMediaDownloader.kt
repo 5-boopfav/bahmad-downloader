@@ -12,7 +12,6 @@ import androidx.core.app.NotificationCompat
 import androidx.work.CoroutineWorker
 import androidx.work.Data
 import androidx.work.ExistingWorkPolicy
-import androidx.work.ForegroundInfo
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
@@ -130,23 +129,19 @@ class BahmadDownloadWorker(
             return Result.failure(outputMessage("الرابط فارغ، تعذر بدء التحميل."))
         }
 
-        ensureNotificationChannel()
+        trySendProgress(5, "جاري تجهيز المحرك...")
         try {
-            setForeground(createForegroundInfo(notifId, rawFileName, "جاري تجهيز المحرك...", 5, indeterminate = true))
+            DownloaderEngineInitializer.ensureInitialized(applicationContext)
+            DownloaderEngineInitializer.updateYtDlpIfNeeded(applicationContext)
         } catch (_: Throwable) {
         }
-
-        setProgress(workDataOf(KEY_PROGRESS to 5, KEY_STATUS to "جاري تجهيز المحرك..."))
-        DownloaderEngineInitializer.ensureInitialized(applicationContext)
-        DownloaderEngineInitializer.updateYtDlpIfNeeded(applicationContext)
-        setProgress(workDataOf(KEY_PROGRESS to 15, KEY_STATUS to "جاري سحب بيانات الفيديو..."))
+        trySendProgress(15, "جاري سحب بيانات الفيديو...")
 
         val tempDir = tempDirFor(applicationContext, workId, url).apply {
             mkdirs()
         }
 
         var completedSuccessfully = false
-        var lastNotifUpdateMs = 0L
 
         return try {
             val isAudioOnly = format.contains("MP3", ignoreCase = true) || format.contains("صوت", ignoreCase = true)
@@ -175,25 +170,13 @@ class BahmadDownloadWorker(
                 val clamped = progress.toInt().coerceIn(15, 92)
                 val statusText = formatStatusLine(progress, line)
                 trySendProgress(clamped, statusText)
-
-                val now = System.currentTimeMillis()
-                if (now - lastNotifUpdateMs >= 1200L) {
-                    lastNotifUpdateMs = now
-                    try {
-                        setForegroundAsync(
-                            createForegroundInfo(notifId, rawFileName, statusText, clamped, indeterminate = false)
-                        )
-                    } catch (_: Throwable) {
-                    }
-                }
             }
 
             if (isStopped) {
-                showCompletionNotification(notifId, rawFileName, "تم إيقاف التحميل مؤقتاً.", success = false)
                 return Result.failure(outputMessage("تم إيقاف التحميل مؤقتاً."))
             }
 
-            setProgress(workDataOf(KEY_PROGRESS to 95, KEY_STATUS to "جاري حفظ الملف في التنزيلات..."))
+            trySendProgress(95, "جاري حفظ الملف في التنزيلات...")
 
             val downloadedFile = tempDir.listFiles()
                 ?.filter { it.isFile && !it.name.endsWith(".part") && it.length() > 1024L }
@@ -257,38 +240,6 @@ class BahmadDownloadWorker(
         }
     }
 
-    private fun ensureNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val mgr = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                CHANNEL_NAME,
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = "إشعارات تقدم وحالة التنزيلات في الخلفية"
-            }
-            mgr.createNotificationChannel(channel)
-        }
-    }
-
-    private fun createForegroundInfo(
-        notifId: Int,
-        title: String,
-        text: String,
-        progress: Int,
-        indeterminate: Boolean
-    ): ForegroundInfo {
-        val notification = NotificationCompat.Builder(applicationContext, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_sys_download)
-            .setContentTitle(title)
-            .setContentText(text)
-            .setOnlyAlertOnce(true)
-            .setOngoing(true)
-            .setProgress(100, progress.coerceIn(0, 100), indeterminate)
-            .build()
-        return ForegroundInfo(notifId, notification)
-    }
-
     private fun showCompletionNotification(
         notifId: Int,
         title: String,
@@ -297,6 +248,16 @@ class BahmadDownloadWorker(
     ) {
         try {
             val mgr = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val channel = NotificationChannel(
+                    CHANNEL_ID,
+                    CHANNEL_NAME,
+                    NotificationManager.IMPORTANCE_LOW
+                ).apply {
+                    description = "إشعارات حالة التنزيلات"
+                }
+                mgr.createNotificationChannel(channel)
+            }
             val notification = NotificationCompat.Builder(applicationContext, CHANNEL_ID)
                 .setSmallIcon(
                     if (success) android.R.drawable.stat_sys_download_done
@@ -305,9 +266,8 @@ class BahmadDownloadWorker(
                 .setContentTitle(title)
                 .setContentText(message)
                 .setAutoCancel(true)
-                .setOngoing(false)
                 .build()
-            mgr.notify(notifId + 50000, notification)
+            mgr.notify(notifId, notification)
         } catch (_: Throwable) {
         }
     }
