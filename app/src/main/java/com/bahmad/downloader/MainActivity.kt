@@ -109,7 +109,7 @@ private fun BahmadMainScreen() {
     var resolvedInfo by remember { mutableStateOf<ResolvedLinkInfo?>(null) }
     var selectedFormat by remember { mutableStateOf("MP4 (أفضل جودة)") }
     var browserUrl by remember { mutableStateOf<String?>(null) }
-    var capturedMediaUrl by remember { mutableStateOf<String?>(null) }
+    var currentPageUrl by remember { mutableStateOf<String?>(null) }
     var selectedTab by remember { mutableIntStateOf(0) }
     val downloadLogs = remember { mutableStateListOf<String>() }
 
@@ -129,7 +129,7 @@ private fun BahmadMainScreen() {
 
         scope.launch(Dispatchers.IO) {
             val wm = WorkManager.getInstance(context.applicationContext)
-            repeat(120) {
+            repeat(180) {
                 val infoList = try {
                     wm.getWorkInfosForUniqueWork("bahmad_dl_$workId").get()
                 } catch (_: Exception) {
@@ -192,7 +192,9 @@ private fun BahmadMainScreen() {
                     onClick = {
                         selectedTab = 2
                         if (browserUrl == null) {
-                            browserUrl = if (urlInput.startsWith("http")) urlInput.trim() else "https://www.dailymotion.com"
+                            val initial = if (urlInput.startsWith("http")) urlInput.trim() else "https://www.dailymotion.com"
+                            browserUrl = initial
+                            currentPageUrl = initial
                         }
                     },
                     icon = { Icon(Icons.Rounded.Public, contentDescription = null) },
@@ -227,7 +229,7 @@ private fun BahmadMainScreen() {
                                 val target = urlInput.trim()
                                 if (target.isNotEmpty() && !isChecking) {
                                     isChecking = true
-                                    statusMessage = "جاري فحص الرابط واستخراج الوسائط..."
+                                    statusMessage = "جاري فحص الرابط واستخراج الفيديو..."
                                     scope.launch {
                                         val result = withContext(Dispatchers.IO) {
                                             DownloaderEngineInitializer.ensureInitialized(context)
@@ -252,7 +254,9 @@ private fun BahmadMainScreen() {
                         OutlinedButton(
                             onClick = {
                                 val target = urlInput.trim().ifEmpty { "https://www.dailymotion.com" }
-                                browserUrl = if (target.startsWith("http")) target else "https://$target"
+                                val formatted = if (target.startsWith("http")) target else "https://$target"
+                                browserUrl = formatted
+                                currentPageUrl = formatted
                                 selectedTab = 2
                             }
                         ) {
@@ -308,25 +312,30 @@ private fun BahmadMainScreen() {
                         )
                         IconButton(onClick = {
                             browserUrl = null
-                            capturedMediaUrl = null
+                            currentPageUrl = null
                             selectedTab = 0
                         }) {
                             Icon(Icons.Rounded.Close, contentDescription = "إغلاق")
                         }
                     }
 
-                    capturedMediaUrl?.let { mediaUrl ->
+                    val activePage = currentPageUrl ?: browserUrl
+                    if (!activePage.isNullOrBlank() && activePage.startsWith("http")) {
                         Button(
                             onClick = {
-                                val capturedInfo = ResolvedLinkInfo(
-                                    originalUrl = mediaUrl,
-                                    directDownloadUrl = mediaUrl,
-                                    fileName = "bahmad_captured_${System.currentTimeMillis()}.mp4",
-                                    sourceLabel = "المتصفح الداخلي",
-                                    fileSizeBytes = -1L,
-                                    suggestedFormats = listOf("MP4 (أفضل جودة)")
-                                )
-                                startBackgroundDownload(capturedInfo, "MP4 (أفضل جودة)")
+                                if (!isChecking) {
+                                    isChecking = true
+                                    statusMessage = "جاري استخراج الفيديو من الصفحة الحالية..."
+                                    scope.launch {
+                                        val result = withContext(Dispatchers.IO) {
+                                            DownloaderEngineInitializer.ensureInitialized(context)
+                                            LinkResolver.resolve(activePage)
+                                        }
+                                        isChecking = false
+                                        resolvedInfo = result
+                                        selectedFormat = result.suggestedFormats.firstOrNull() ?: "MP4 (أفضل جودة)"
+                                    }
+                                }
                             },
                             modifier = Modifier.fillMaxWidth(),
                             colors = ButtonDefaults.buttonColors(
@@ -336,14 +345,18 @@ private fun BahmadMainScreen() {
                         ) {
                             Icon(Icons.Rounded.Download, contentDescription = null)
                             Spacer(modifier = Modifier.width(8.dp))
-                            Text("تحميل الوسائط الملتقطة", fontWeight = FontWeight.Bold)
+                            Text(
+                                text = if (isChecking) "جاري استخراج الفيديو..." else "استخراج وتحميل فيديو الصفحة الحالية",
+                                fontWeight = FontWeight.Bold
+                            )
                         }
                     }
 
                     BahmadWebBrowserView(
                         url = browserUrl ?: "https://www.dailymotion.com",
-                        onMediaDetected = { detected ->
-                            capturedMediaUrl = detected
+                        onPageUrlChanged = { updatedUrl ->
+                            currentPageUrl = updatedUrl
+                            browserUrl = updatedUrl
                         },
                         modifier = Modifier
                             .fillMaxWidth()
@@ -398,7 +411,7 @@ private fun BahmadMainScreen() {
                         onClick = {
                             if (info.isHtmlPage) {
                                 browserUrl = info.originalUrl
-                                capturedMediaUrl = null
+                                currentPageUrl = info.originalUrl
                                 resolvedInfo = null
                                 selectedTab = 2
                             } else {
@@ -436,7 +449,7 @@ private fun BahmadMainScreen() {
 @Composable
 private fun BahmadWebBrowserView(
     url: String,
-    onMediaDetected: (String) -> Unit,
+    onPageUrlChanged: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
     Box(modifier = modifier.background(Color.Black)) {
@@ -445,17 +458,12 @@ private fun BahmadWebBrowserView(
                 WebView(ctx).apply {
                     settings.javaScriptEnabled = true
                     settings.domStorageEnabled = true
+                    settings.userAgentString = LinkResolver.BROWSER_USER_AGENT
                     webViewClient = object : WebViewClient() {
-                        override fun onLoadResource(view: WebView?, resUrl: String?) {
-                            val candidate = resUrl.orEmpty()
-                            val lower = candidate.lowercase()
-                            if (
-                                lower.contains(".mp4") ||
-                                lower.contains(".m3u8") ||
-                                lower.contains(".mp3") ||
-                                lower.contains("videoplayback")
-                            ) {
-                                onMediaDetected(candidate)
+                        override fun onPageFinished(view: WebView?, loadedUrl: String?) {
+                            val current = loadedUrl.orEmpty()
+                            if (current.startsWith("http://") || current.startsWith("https://")) {
+                                onPageUrlChanged(current)
                             }
                         }
 
