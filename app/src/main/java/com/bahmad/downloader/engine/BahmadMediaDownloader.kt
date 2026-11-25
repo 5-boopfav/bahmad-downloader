@@ -64,6 +64,7 @@ class BahmadDownloadWorker(
         }
 
         DownloaderEngineInitializer.ensureInitialized(applicationContext)
+        DownloaderEngineInitializer.updateYtDlpIfNeeded(applicationContext)
 
         val tempDir = File(applicationContext.cacheDir, "bahmad_dl_${UUID.randomUUID()}").apply {
             mkdirs()
@@ -75,8 +76,7 @@ class BahmadDownloadWorker(
             val outputTemplate = File(tempDir, "$baseName.%(ext)s").absolutePath
 
             val dlRequest = YoutubeDLRequest(url).apply {
-                addOption("--no-playlist")
-                addOption("--user-agent", LinkResolver.BROWSER_USER_AGENT)
+                LinkResolver.applyCommonOptions(this, url)
                 addOption("-o", outputTemplate)
                 if (isAudioOnly) {
                     addOption("-x")
