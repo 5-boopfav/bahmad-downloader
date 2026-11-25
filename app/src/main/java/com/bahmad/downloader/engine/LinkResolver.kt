@@ -33,6 +33,17 @@ object LinkResolver {
     private const val DEFAULT_USER_AGENT =
         "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
 
+    private val adKeywords = listOf(
+        "/ad/", "/ads/", "ad_break", "preroll", "pre-roll", "midroll", "postroll",
+        "vast", "vmap", "doubleclick", "googlesyndication", "adserver", "commercial"
+    )
+
+    fun isLikelyAdUrl(url: String): Boolean {
+        val lower = url.lowercase()
+        return adKeywords.any { lower.contains(it) } ||
+            Regex("""(?:^|[/?_&-])(ad|ads|preroll|midroll|postroll)(?:$|[/?_&-])""").containsMatchIn(lower)
+    }
+
     fun resolve(rawUrl: String): ResolvedLinkInfo {
         val trimmed = rawUrl.trim()
         if (!trimmed.startsWith("http://") && !trimmed.startsWith("https://")) {
@@ -46,9 +57,20 @@ object LinkResolver {
             )
         }
 
+        if (isLikelyAdUrl(trimmed)) {
+            return ResolvedLinkInfo(
+                originalUrl = trimmed,
+                directDownloadUrl = trimmed,
+                fileName = "bahmad_ad_blocked_${System.currentTimeMillis()}.mp4",
+                isHtmlPage = false,
+                sourceLabel = "رابط إعلاني مستبعد",
+                note = "تم رصد مؤشرات إعلان في الرابط؛ شغّل الفيديو الرئيسي وانتظر بدء المحتوى الفعلي.",
+                suggestedFormats = listOf("MP4 (أفضل جودة)")
+            )
+        }
+
         val sourceLabel = detectSourceLabel(trimmed)
 
-        // 1) محاولة الاستخراج عبر محرك yt-dlp (مثل بحمد 1)
         val ytdlpResult = runCatching {
             val request = YoutubeDLRequest(trimmed).apply {
                 addOption("--no-playlist")
@@ -57,7 +79,7 @@ object LinkResolver {
             val videoInfo = YoutubeDL.getInstance().getInfo(request)
             val title = sanitizeFileName(videoInfo.title.orEmpty().ifBlank { "bahmad_video_${System.currentTimeMillis()}" })
             val ext = videoInfo.ext?.takeIf { it.isNotBlank() } ?: "mp4"
-            val streamUrl = videoInfo.url?.takeIf { it.isNotBlank() } ?: trimmed
+            val streamUrl = videoInfo.url?.takeIf { it.isNotBlank() && !isLikelyAdUrl(it) } ?: trimmed
             val extractorLabel = videoInfo.extractor?.takeIf { it.isNotBlank() } ?: sourceLabel
 
             ResolvedLinkInfo(
@@ -69,7 +91,7 @@ object LinkResolver {
                 isStreamPlaylist = streamUrl.contains(".m3u8", ignoreCase = true),
                 isHtmlPage = false,
                 sourceLabel = extractorLabel,
-                note = "تم استخراج الوسائط عبر محرك yt-dlp بنجاح.",
+                note = "تم استخراج الفيديو الأساسي عبر محرك yt-dlp.",
                 suggestedFormats = listOf("MP4 (أفضل جودة)", "MP3 (صوت فقط)", "الأصلية")
             )
         }.getOrNull()
@@ -78,7 +100,6 @@ object LinkResolver {
             return ytdlpResult
         }
 
-        // 2) فحص احتياطي عبر OkHttp للروابط المباشرة
         return try {
             val probeRequest = Request.Builder()
                 .url(trimmed)
