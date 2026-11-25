@@ -29,15 +29,22 @@ data class DownloadOutcome(
 object DownloaderEngineInitializer {
 
     private val initialized = AtomicBoolean(false)
+    private val updateChecked = AtomicBoolean(false)
 
     @Volatile
     var lastStatusMessage: String = "محرك التحميل جاهز للتهيئة"
         private set
 
     fun ensureInitialized(context: Context): Boolean {
-        if (initialized.get()) return true
+        if (initialized.get()) {
+            maybeUpdateEngineAsync(context)
+            return true
+        }
         synchronized(this) {
-            if (initialized.get()) return true
+            if (initialized.get()) {
+                maybeUpdateEngineAsync(context)
+                return true
+            }
             return try {
                 val appContext = context.applicationContext
                 val workDir = File(appContext.cacheDir, "bahmad_engine").apply { mkdirs() }
@@ -53,6 +60,9 @@ object DownloaderEngineInitializer {
                     "تعذر تهيئة مجلدات العمل"
                 }
                 initialized.set(ready)
+                if (ready) {
+                    maybeUpdateEngineAsync(appContext)
+                }
                 ready
             } catch (e: Exception) {
                 lastStatusMessage = "فشل تهيئة المحرك: ${e.message ?: "خطأ غير معروف"}"
@@ -60,9 +70,23 @@ object DownloaderEngineInitializer {
             }
         }
     }
+
+    private fun maybeUpdateEngineAsync(context: Context) {
+        if (!updateChecked.compareAndSet(false, true)) return
+        Thread {
+            runCatching {
+                YoutubeDL.getInstance().updateYoutubeDL(
+                    context.applicationContext,
+                    YoutubeDL.UpdateChannel.STABLE
+                )
+            }
+        }.start()
+    }
 }
 
 object BahmadMediaDownloader {
+
+    private const val MIN_REAL_MEDIA_BYTES = 262_144L // 256 KB لتجنب حفظ ملفات فارغة أو مقطوعة
 
     fun enqueueBackgroundDownload(
         context: Context,
@@ -110,31 +134,64 @@ object BahmadMediaDownloader {
 
         val baseTitle = sanitizeBaseName(rawFileName)
         val stagingDir = File(context.cacheDir, "bahmad_ytdl_out_${UUID.randomUUID()}").apply { mkdirs() }
+        val logBuilder = StringBuilder()
 
         return try {
             val request = YoutubeDLRequest(cleanUrl).apply {
                 addOption("--no-playlist")
                 addOption("--no-warnings")
+                addOption("--no-check-certificates")
+                addOption("--geo-bypass")
+                addOption("--retries", "3")
+                addOption("--fragment-retries", "3")
                 if (isAudioOnly) {
                     addOption("-x")
                     addOption("--audio-format", "mp3")
                     addOption("-o", "${stagingDir.absolutePath}/$baseTitle.%(ext)s")
                 } else {
-                    addOption("-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best")
+                    addOption("-f", "bestvideo+bestaudio/best")
                     addOption("--merge-output-format", "mp4")
                     addOption("-o", "${stagingDir.absolutePath}/$baseTitle.%(ext)s")
                 }
             }
 
-            YoutubeDL.getInstance().execute(request, "bahmad_${System.currentTimeMillis()}", null)
+            YoutubeDL.getInstance().execute(
+                request,
+                "bahmad_${System.currentTimeMillis()}"
+            ) { _, _, line ->
+                if (!line.isNullOrBlank()) {
+                    if (logBuilder.length > 2000) {
+                        logBuilder.delete(0, logBuilder.length - 1200)
+                    }
+                    logBuilder.append(line).append('\n')
+                }
+            }
 
             val outputFile = stagingDir.listFiles()
-                ?.filter { it.isFile && it.length() > 1024L && !it.name.endsWith(".part") && !it.name.endsWith(".ytdl") }
+                ?.filter {
+                    it.isFile &&
+                        it.length() >= MIN_REAL_MEDIA_BYTES &&
+                        !it.name.endsWith(".part") &&
+                        !it.name.endsWith(".ytdl") &&
+                        !it.name.endsWith(".temp") &&
+                        !it.name.endsWith(".tmp")
+                }
                 ?.maxByOrNull { it.lastModified() }
 
             if (outputFile == null) {
                 deleteRecursively(stagingDir)
-                return DownloadOutcome(false, "لم يتم إنتاج ملف وسائط مكتمل؛ تأكد من صلاحية الرابط.")
+                val lastErr = logBuilder.toString()
+                    .lineSequence()
+                    .lastOrNull { it.isNotBlank() }
+                    ?.take(150)
+                return DownloadOutcome(
+                    false,
+                    if (lastErr != null) {
+                        "لم يكتمل تنزيل وسائط صالحة: $lastErr"
+                    } else {
+                        "لم يتم إنتاج ملف وسائط صالح؛ قد يكون الفيديو مقيداً أو يتطلب تحديث yt-dlp."
+                    }
+                )
             }
 
             val finalExt = outputFile.extension.ifBlank { if (isAudioOnly) "mp3" else "mp4" }
@@ -154,7 +211,12 @@ object BahmadMediaDownloader {
             }
         } catch (e: Exception) {
             deleteRecursively(stagingDir)
-            DownloadOutcome(false, "حدث خطأ أثناء التنزيل: ${e.message ?: "خطأ غير معروف"}")
+            val detail = logBuilder.toString()
+                .lineSequence()
+                .lastOrNull { it.isNotBlank() }
+                ?: e.message?.lineSequence()?.lastOrNull { it.isNotBlank() }
+                ?: "خطأ غير معروف"
+            DownloadOutcome(false, "فشل التنزيل: ${detail.take(160)}")
         }
     }
 
